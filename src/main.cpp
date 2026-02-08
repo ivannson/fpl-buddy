@@ -8,6 +8,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <lvgl.h>
+#include <time.h>
 
 #include "fpl_config.h"
 #include "wifi_config.h"
@@ -24,9 +25,11 @@ static uint8_t *lvglBuf = nullptr;
 
 // UI objects
 static lv_obj_t *arcProgress = nullptr;
-static lv_obj_t *circleObj = nullptr;
 static lv_obj_t *labelStatus = nullptr;
 static lv_obj_t *labelPoints = nullptr;
+static lv_obj_t *labelGwState = nullptr;
+static lv_obj_t *labelUkTime = nullptr;
+static lv_obj_t *labelDeadline = nullptr;
 
 static uint32_t lastPollMs = 0;
 static uint32_t lastWifiRetryMs = 0;
@@ -38,11 +41,18 @@ struct SharedUiState {
     bool hasGwPoints = false;
     uint32_t statusColor = 0xFFFFFF;
     char statusText[48] = "Booting...";
+    char gwStateText[48] = "GW live: ? | next: --";
+    int nextGw = 0;
+    bool hasNextGw = false;
+    time_t nextDeadlineUtc = 0;
+    bool hasNextDeadline = false;
     uint32_t version = 0;
 };
 
 static SharedUiState sharedUiState;
 static SemaphoreHandle_t sharedUiMutex = nullptr;
+static bool timeConfigured = false;
+static bool parseIsoUtcToEpoch(const char *iso, time_t &epochOut);
 
 struct TeamPick {
     struct LiveStats {
@@ -339,6 +349,74 @@ static bool fetchEntrySummary(int &currentGwOut) {
     return true;
 }
 
+static bool fetchGameweekState(bool &isLiveOut, int &nextGwOut, bool &hasDeadlineOut, time_t &deadlineOut) {
+    DynamicJsonDocument filter(512);
+    JsonArray eventsFilter = filter.createNestedArray("events");
+    JsonObject eventFilter = eventsFilter.createNestedObject();
+    eventFilter["id"] = true;
+    eventFilter["is_current"] = true;
+    eventFilter["is_next"] = true;
+    eventFilter["finished"] = true;
+    eventFilter["deadline_time"] = true;
+    eventFilter["deadline_time_epoch"] = true;
+
+    DynamicJsonDocument doc(8192);
+    const String url = "https://fantasy.premierleague.com/api/bootstrap-static/";
+    if (!getJsonDocumentFromPsramUrl(url, doc, FPL_BOOTSTRAP_PSRAM_MAX_BYTES, &filter)) {
+        return false;
+    }
+
+    JsonArray events = doc["events"].as<JsonArray>();
+    if (events.isNull()) {
+        Serial.println("bootstrap response missing events");
+        return false;
+    }
+
+    bool foundCurrent = false;
+    bool foundNext = false;
+    bool currentFinished = false;
+    int nextGw = 0;
+    bool hasDeadline = false;
+    time_t parsedDeadline = 0;
+
+    for (JsonObject e : events) {
+        if (e["is_current"] | false) {
+            foundCurrent = true;
+            currentFinished = e["finished"] | false;
+        }
+        if (e["is_next"] | false) {
+            foundNext = true;
+            nextGw = e["id"] | 0;
+            const char *deadlineIso = e["deadline_time"] | nullptr;
+            if (parseIsoUtcToEpoch(deadlineIso, parsedDeadline)) {
+                hasDeadline = true;
+            } else {
+                const int64_t epoch = e["deadline_time_epoch"] | 0;
+                if (epoch > 0) {
+                    parsedDeadline = static_cast<time_t>(epoch);
+                    hasDeadline = true;
+                    Serial.printf("Using deadline_time_epoch fallback for GW%d: %lld\n", nextGw,
+                                  static_cast<long long>(epoch));
+                } else {
+                    Serial.printf("Failed to parse deadline_time for GW%d: %s\n", nextGw,
+                                  deadlineIso ? deadlineIso : "null");
+                }
+            }
+        }
+    }
+
+    if (!foundCurrent && !foundNext) {
+        return false;
+    }
+
+    // Proxy for live state from bootstrap event flags.
+    isLiveOut = foundCurrent && !currentFinished;
+    nextGwOut = foundNext ? nextGw : 0;
+    hasDeadlineOut = hasDeadline;
+    deadlineOut = parsedDeadline;
+    return true;
+}
+
 static bool fetchPicksForGw(int gw, TeamPick *picks, size_t picksCapacity, size_t &pickCountOut, String &activeChipOut) {
     DynamicJsonDocument filter(512);
     filter["active_chip"] = true;
@@ -567,6 +645,209 @@ static int savesThresholdForElementType(int elementType) {
     return 0;
 }
 
+static int computeExpectedPointsExcludingBonus(const TeamPick &p, bool &okOut) {
+    okOut = false;
+    if (p.elementType < 1 || p.elementType > 4) {
+        return 0;
+    }
+
+    int pts = 0;
+    if (p.live.minutes > 0) {
+        pts += 1;
+    }
+    if (p.live.minutes >= 60) {
+        pts += 1;
+    }
+
+    pts += goalPointsForElementType(p.elementType) * p.live.goalsScored;
+    pts += 3 * p.live.assists;
+    pts += cleanSheetPointsForElementType(p.elementType) * p.live.cleanSheets;
+
+    if (p.elementType == 1) {
+        pts += p.live.saves / 3;
+        pts += 5 * p.live.penaltiesSaved;
+    }
+
+    if (p.elementType == 1 || p.elementType == 2) {
+        pts -= p.live.goalsConceded / 2;
+    }
+
+    pts -= 2 * p.live.penaltiesMissed;
+    pts -= p.live.yellowCards;
+    pts -= 3 * p.live.redCards;
+    pts -= 2 * p.live.ownGoals;
+
+    const int dcThreshold = defensiveContributionThresholdForElementType(p.elementType);
+    if (dcThreshold > 0) {
+        pts += 2 * (p.live.defensiveContributions / dcThreshold);
+    }
+
+    okOut = true;
+    return pts;
+}
+
+static int adjustedLivePointsWithProjectedBonus(const TeamPick &p, bool &projectedBonusAddedOut,
+                                                bool &bonusAlreadyIncludedOut) {
+    projectedBonusAddedOut = false;
+    bonusAlreadyIncludedOut = true;
+
+    if (p.live.bonus <= 0) {
+        return p.live.totalPoints;
+    }
+
+    bool canScore = false;
+    const int noBonus = computeExpectedPointsExcludingBonus(p, canScore);
+    if (!canScore) {
+        // Unknown element type: prefer raw points to avoid possible double counting.
+        return p.live.totalPoints;
+    }
+
+    const int withBonus = noBonus + p.live.bonus;
+    if (p.live.totalPoints == withBonus) {
+        bonusAlreadyIncludedOut = true;
+        return p.live.totalPoints;
+    }
+    if (p.live.totalPoints == noBonus) {
+        bonusAlreadyIncludedOut = false;
+        projectedBonusAddedOut = true;
+        return p.live.totalPoints + p.live.bonus;
+    }
+
+    // If raw total is closer to non-bonus score, treat bonus as not yet included.
+    const int distNoBonus = abs(p.live.totalPoints - noBonus);
+    const int distWithBonus = abs(p.live.totalPoints - withBonus);
+    if (distNoBonus <= distWithBonus) {
+        bonusAlreadyIncludedOut = false;
+        projectedBonusAddedOut = true;
+        return p.live.totalPoints + p.live.bonus;
+    }
+
+    bonusAlreadyIncludedOut = true;
+    return p.live.totalPoints;
+}
+
+static void appendBreakdownPart(char *buf, size_t bufLen, bool &firstPart, int pts, const char *label) {
+    if (pts == 0 || !label || !buf || bufLen == 0) {
+        return;
+    }
+    char part[64];
+    snprintf(part, sizeof(part), "%s%d %s%s", firstPart ? "" : "; ", pts, (abs(pts) == 1) ? "pt" : "pts", label);
+    strlcat(buf, part, bufLen);
+    firstPart = false;
+}
+
+static void formatPointsBreakdown(const TeamPick &p, bool projectedBonusAdded, bool bonusIncluded, int adjustedPoints,
+                                  char *out, size_t outLen) {
+    if (!out || outLen == 0) {
+        return;
+    }
+    out[0] = '\0';
+    bool firstPart = true;
+    int explained = 0;
+
+    if (p.live.minutes > 0) {
+        appendBreakdownPart(out, outLen, firstPart, +1, " - appearance");
+        explained += 1;
+    }
+    if (p.live.minutes >= 60) {
+        appendBreakdownPart(out, outLen, firstPart, +1, " - 60+ mins");
+        explained += 1;
+    }
+
+    const int goalPts = goalPointsForElementType(p.elementType) * p.live.goalsScored;
+    if (goalPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, goalPts, " - goals");
+        explained += goalPts;
+    }
+
+    const int assistPts = 3 * p.live.assists;
+    if (assistPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, assistPts, " - assists");
+        explained += assistPts;
+    }
+
+    const int csPts = cleanSheetPointsForElementType(p.elementType) * p.live.cleanSheets;
+    if (csPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, csPts, " - clean sheet");
+        explained += csPts;
+    }
+
+    if (p.elementType == 1) {
+        const int savePts = p.live.saves / 3;
+        if (savePts != 0) {
+            appendBreakdownPart(out, outLen, firstPart, savePts, " - saves");
+            explained += savePts;
+        }
+    }
+
+    const int penSavePts = 5 * p.live.penaltiesSaved;
+    if (penSavePts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, penSavePts, " - pen save");
+        explained += penSavePts;
+    }
+
+    const int dcThreshold = defensiveContributionThresholdForElementType(p.elementType);
+    if (dcThreshold > 0) {
+        const int dcPts = 2 * (p.live.defensiveContributions / dcThreshold);
+        if (dcPts != 0) {
+            appendBreakdownPart(out, outLen, firstPart, dcPts, " - defensive contrib");
+            explained += dcPts;
+        }
+    }
+
+    if (p.live.bonus > 0) {
+        if (projectedBonusAdded) {
+            appendBreakdownPart(out, outLen, firstPart, p.live.bonus, " - bonus (projected)");
+            explained += p.live.bonus;
+        } else if (bonusIncluded) {
+            appendBreakdownPart(out, outLen, firstPart, p.live.bonus, " - bonus");
+            explained += p.live.bonus;
+        }
+    }
+
+    if (p.elementType == 1 || p.elementType == 2) {
+        const int gcPts = -(p.live.goalsConceded / 2);
+        if (gcPts != 0) {
+            appendBreakdownPart(out, outLen, firstPart, gcPts, " - goals conceded");
+            explained += gcPts;
+        }
+    }
+
+    const int penMissPts = -2 * p.live.penaltiesMissed;
+    if (penMissPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, penMissPts, " - pen miss");
+        explained += penMissPts;
+    }
+
+    const int ycPts = -p.live.yellowCards;
+    if (ycPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, ycPts, " - yellow card");
+        explained += ycPts;
+    }
+
+    const int rcPts = -3 * p.live.redCards;
+    if (rcPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, rcPts, " - red card");
+        explained += rcPts;
+    }
+
+    const int ogPts = -2 * p.live.ownGoals;
+    if (ogPts != 0) {
+        appendBreakdownPart(out, outLen, firstPart, ogPts, " - own goal");
+        explained += ogPts;
+    }
+
+    if (firstPart) {
+        strlcpy(out, "0 pts - no returns yet", outLen);
+        return;
+    }
+
+    const int unattributed = adjustedPoints - explained;
+    if (unattributed != 0) {
+        appendBreakdownPart(out, outLen, firstPart, unattributed, " - other/live adjustments");
+    }
+}
+
 static void notifyEvent(const char *name, int pts, const char *what) {
     Serial.printf("[FPL EVENT] %s %+d pt%s, %s\n", name, pts, (pts == 1 || pts == -1) ? "" : "s", what);
 }
@@ -748,9 +1029,14 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut) {
 
     detectAndNotifyPointChanges(currentGw, picks, pickCount);
 
+    int adjustedPoints[16];
+    bool projectedBonusAdded[16];
+    bool bonusIncluded[16];
     int computedGwPoints = 0;
     for (size_t i = 0; i < pickCount; ++i) {
-        computedGwPoints += picks[i].live.totalPoints * picks[i].multiplier;
+        adjustedPoints[i] =
+            adjustedLivePointsWithProjectedBonus(picks[i], projectedBonusAdded[i], bonusIncluded[i]);
+        computedGwPoints += adjustedPoints[i] * picks[i].multiplier;
     }
     gwPointsOut = computedGwPoints;
 
@@ -767,17 +1053,32 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut) {
     for (size_t i = 0; i < pickCount; ++i) {
         TeamPick &p = picks[i];
         const char *slot = (p.squadPosition <= 11) ? "XI" : "BENCH";
-        const int effectivePoints = p.live.totalPoints * p.multiplier;
+        const int currPoints = adjustedPoints[i];
+        const int effectivePoints = currPoints * p.multiplier;
+        const bool showBonusState = p.live.bonus > 0;
+        const char *bonusState = projectedBonusAdded[i] ? "proj" : (bonusIncluded[i] ? "in" : "unk");
+        char breakdown[256];
+        formatPointsBreakdown(p, projectedBonusAdded[i], bonusIncluded[i], currPoints, breakdown, sizeof(breakdown));
         if (hasPlayerMeta) {
-            Serial.printf("  [%2d] %-5s | %-15s | %-3s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d\n",
+            Serial.printf("  [%2d] %-5s | %-15s | %-3s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d",
                           p.squadPosition, slot,
                           p.playerName.length() ? p.playerName.c_str() : "unknown",
-                          p.positionName.length() ? p.positionName.c_str() : "?", p.live.totalPoints, p.elementId,
+                          p.positionName.length() ? p.positionName.c_str() : "?", currPoints, p.elementId,
                           p.multiplier, p.isCaptain ? " C" : "", p.isViceCaptain ? " VC" : "", effectivePoints);
+            if (showBonusState) {
+                Serial.printf(" | bonus:%d(%s)", p.live.bonus, bonusState);
+            }
+            Serial.println();
+            Serial.printf("       breakdown: %s\n", breakdown);
         } else {
-            Serial.printf("  [%2d] %-5s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d\n", p.squadPosition, slot,
-                          p.live.totalPoints, p.elementId, p.multiplier, p.isCaptain ? " C" : "",
+            Serial.printf("  [%2d] %-5s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d", p.squadPosition, slot,
+                          currPoints, p.elementId, p.multiplier, p.isCaptain ? " C" : "",
                           p.isViceCaptain ? " VC" : "", effectivePoints);
+            if (showBonusState) {
+                Serial.printf(" | bonus:%d(%s)", p.live.bonus, bonusState);
+            }
+            Serial.println();
+            Serial.printf("       breakdown: %s\n", breakdown);
         }
     }
     Serial.println("=========================\n");
@@ -835,6 +1136,27 @@ static void updatePoints(int points) {
     lv_label_set_text(labelPoints, buf);
 }
 
+static void updateGwStateText(const char *text) {
+    if (!labelGwState) {
+        return;
+    }
+    lv_label_set_text(labelGwState, text);
+}
+
+static void updateUkTimeText(const char *text) {
+    if (!labelUkTime) {
+        return;
+    }
+    lv_label_set_text(labelUkTime, text);
+}
+
+static void updateDeadlineText(const char *text) {
+    if (!labelDeadline) {
+        return;
+    }
+    lv_label_set_text(labelDeadline, text);
+}
+
 static void setSharedStatus(const char *text, uint32_t colorHex) {
     if (!sharedUiMutex) {
         return;
@@ -863,6 +1185,35 @@ static void setSharedGwPoints(int points) {
     xSemaphoreGive(sharedUiMutex);
 }
 
+static void setSharedGwStateText(const char *text) {
+    if (!sharedUiMutex) {
+        return;
+    }
+    if (xSemaphoreTake(sharedUiMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    strlcpy(sharedUiState.gwStateText, text, sizeof(sharedUiState.gwStateText));
+    sharedUiState.version++;
+    xSemaphoreGive(sharedUiMutex);
+}
+
+static void setSharedGwTiming(int nextGw, bool hasNextGw, time_t deadlineUtc, bool hasDeadline) {
+    if (!sharedUiMutex) {
+        return;
+    }
+    if (xSemaphoreTake(sharedUiMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    sharedUiState.nextGw = nextGw;
+    sharedUiState.hasNextGw = hasNextGw;
+    sharedUiState.nextDeadlineUtc = deadlineUtc;
+    sharedUiState.hasNextDeadline = hasDeadline;
+    sharedUiState.version++;
+    xSemaphoreGive(sharedUiMutex);
+}
+
 static bool readSharedUiState(SharedUiState &out) {
     if (!sharedUiMutex) {
         return false;
@@ -874,6 +1225,133 @@ static bool readSharedUiState(SharedUiState &out) {
     out = sharedUiState;
     xSemaphoreGive(sharedUiMutex);
     return true;
+}
+
+static int64_t daysFromCivil(int y, unsigned m, unsigned d) {
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + static_cast<int>(doe) - 719468;
+}
+
+static bool parseIsoUtcToEpoch(const char *iso, time_t &epochOut) {
+    if (!iso) {
+        return false;
+    }
+    int y = 0;
+    int mon = 0;
+    int day = 0;
+    int hh = 0;
+    int mm = 0;
+    int ss = 0;
+    int n = 0;
+    if (sscanf(iso, "%d-%d-%dT%d:%d:%d%n", &y, &mon, &day, &hh, &mm, &ss, &n) != 6) {
+        return false;
+    }
+
+    // Accept: Z, .sssZ, +HH:MM, -HH:MM, or no suffix.
+    const char *tz = iso + n;
+    if (*tz == '.') {
+        ++tz;
+        while (*tz >= '0' && *tz <= '9') {
+            ++tz;
+        }
+    }
+
+    int tzOffsetSec = 0;
+    if (*tz == 'Z' || *tz == '\0') {
+        // UTC or no explicit zone.
+    } else if (*tz == '+' || *tz == '-') {
+        const int sign = (*tz == '-') ? -1 : 1;
+        ++tz;
+        int tzh = 0;
+        int tzm = 0;
+        if (sscanf(tz, "%d:%d", &tzh, &tzm) == 2) {
+            tzOffsetSec = sign * (tzh * 3600 + tzm * 60);
+        } else if (sscanf(tz, "%2d%2d", &tzh, &tzm) == 2) {
+            tzOffsetSec = sign * (tzh * 3600 + tzm * 60);
+        } else {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    const int64_t days = daysFromCivil(y, static_cast<unsigned>(mon), static_cast<unsigned>(day));
+    int64_t sec = days * 86400LL + hh * 3600LL + mm * 60LL + ss;
+    sec -= tzOffsetSec;
+    epochOut = static_cast<time_t>(sec);
+    return true;
+}
+
+static bool ensureUkTimeConfigured() {
+    if (timeConfigured && time(nullptr) > 100000) {
+        return true;
+    }
+
+    setenv("TZ", "GMT0BST,M3.5.0/1,M10.5.0/2", 1);
+    tzset();
+    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+
+    const uint32_t startMs = millis();
+    while (millis() - startMs < 10000) {
+        if (time(nullptr) > 100000) {
+            timeConfigured = true;
+            Serial.println("NTP synced (UK timezone)");
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    Serial.println("NTP sync timeout");
+    return false;
+}
+
+static void formatUkNow(char *out, size_t outLen) {
+    const time_t now = time(nullptr);
+    if (now <= 100000) {
+        strlcpy(out, "UK time: --", outLen);
+        return;
+    }
+    struct tm localTm;
+    localtime_r(&now, &localTm);
+    char timeBuf[32];
+    strftime(timeBuf, sizeof(timeBuf), "%a %d %b %H:%M", &localTm);
+    snprintf(out, outLen, "UK: %s", timeBuf);
+}
+
+static void formatDeadlineInfo(const SharedUiState &state, char *out, size_t outLen) {
+    if (!state.hasNextDeadline || state.nextDeadlineUtc <= 0) {
+        strlcpy(out, "Deadline: --\nLeft: --", outLen);
+        return;
+    }
+
+    struct tm deadlineTm;
+    localtime_r(&state.nextDeadlineUtc, &deadlineTm);
+    char deadlineBuf[40];
+    strftime(deadlineBuf, sizeof(deadlineBuf), "%a %d %b %H:%M", &deadlineTm);
+
+    const time_t now = time(nullptr);
+    if (now <= 100000) {
+        snprintf(out, outLen, "GW%d DL: %s\nLeft: --", state.hasNextGw ? state.nextGw : 0, deadlineBuf);
+        return;
+    }
+
+    int64_t diff = static_cast<int64_t>(state.nextDeadlineUtc) - static_cast<int64_t>(now);
+    if (diff < 0) {
+        diff = 0;
+    }
+
+    const int days = static_cast<int>(diff / 86400);
+    diff %= 86400;
+    const int hours = static_cast<int>(diff / 3600);
+    diff %= 3600;
+    const int minutes = static_cast<int>(diff / 60);
+
+    snprintf(out, outLen, "GW%d DL: %s\nLeft: %dd %02dh %02dm", state.hasNextGw ? state.nextGw : 0, deadlineBuf,
+             days, hours, minutes);
 }
 
 static void createUi() {
@@ -901,16 +1379,6 @@ static void createUi() {
     lv_obj_remove_style(arcProgress, nullptr, LV_PART_KNOB);
     lv_obj_remove_flag(arcProgress, LV_OBJ_FLAG_CLICKABLE);
 
-    circleObj = lv_obj_create(screen);
-    lv_obj_set_size(circleObj, center_circle, center_circle);
-    lv_obj_center(circleObj);
-    lv_obj_set_y(circleObj, -(center_circle / 2) - 26);
-    lv_obj_set_style_radius(circleObj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(circleObj, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    lv_obj_set_style_border_width(circleObj, 0, LV_PART_MAIN);
-    lv_obj_remove_flag(circleObj, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(circleObj, LV_OBJ_FLAG_CLICKABLE);
-
     labelPoints = lv_label_create(screen);
     lv_label_set_text(labelPoints, "GW Points\n--");
     lv_obj_set_style_text_color(labelPoints, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
@@ -922,7 +1390,32 @@ static void createUi() {
     lv_label_set_text(labelStatus, "Booting...");
     lv_obj_set_style_text_color(labelStatus, lv_color_hex(0xA0A0A0), LV_PART_MAIN);
     lv_obj_set_style_text_align(labelStatus, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(labelStatus, LV_ALIGN_BOTTOM_MID, 0, -18);
+    lv_obj_set_width(labelStatus, kDisplayWidth - 40);
+    lv_obj_align(labelStatus, LV_ALIGN_CENTER, 0, 156);
+
+    labelGwState = lv_label_create(screen);
+    lv_label_set_text(labelGwState, "GW live: ? | next: --");
+    lv_obj_set_style_text_color(labelGwState, lv_color_hex(0x8FA1B3), LV_PART_MAIN);
+    lv_obj_set_style_text_align(labelGwState, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(labelGwState, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_width(labelGwState, kDisplayWidth - 40);
+    lv_obj_align(labelGwState, LV_ALIGN_CENTER, 0, -106);
+
+    labelUkTime = lv_label_create(screen);
+    lv_label_set_text(labelUkTime, "UK: --");
+    lv_obj_set_style_text_color(labelUkTime, lv_color_hex(0xB9C6D3), LV_PART_MAIN);
+    lv_obj_set_style_text_align(labelUkTime, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(labelUkTime, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_width(labelUkTime, kDisplayWidth - 40);
+    lv_obj_align(labelUkTime, LV_ALIGN_CENTER, 0, -82);
+
+    labelDeadline = lv_label_create(screen);
+    lv_label_set_text(labelDeadline, "Deadline: --\nLeft: --");
+    lv_obj_set_style_text_color(labelDeadline, lv_color_hex(0xD8DEE5), LV_PART_MAIN);
+    lv_obj_set_style_text_align(labelDeadline, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_font(labelDeadline, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_width(labelDeadline, kDisplayWidth - 46);
+    lv_obj_align(labelDeadline, LV_ALIGN_CENTER, 0, 104);
 
     lv_anim_t arcAnimation;
     lv_anim_init(&arcAnimation);
@@ -960,6 +1453,7 @@ static bool connectWiFi() {
 static void uiTask(void *) {
     SharedUiState localState;
     uint32_t appliedVersion = 0;
+    uint32_t lastTimeUiUpdateMs = 0;
 
     for (;;) {
         lv_timer_handler();
@@ -969,7 +1463,19 @@ static void uiTask(void *) {
                 updatePoints(localState.gwPoints);
             }
             updateStatus(localState.statusText, lv_color_hex(localState.statusColor));
+            updateGwStateText(localState.gwStateText);
             appliedVersion = localState.version;
+        }
+
+        const uint32_t nowMs = millis();
+        if (nowMs - lastTimeUiUpdateMs >= 1000) {
+            char nowBuf[48];
+            char deadlineBuf[96];
+            formatUkNow(nowBuf, sizeof(nowBuf));
+            formatDeadlineInfo(localState, deadlineBuf, sizeof(deadlineBuf));
+            updateUkTimeText(nowBuf);
+            updateDeadlineText(deadlineBuf);
+            lastTimeUiUpdateMs = nowMs;
         }
 
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -989,6 +1495,7 @@ static void fplTask(void *) {
                 lastWifiRetryMs = now;
                 setSharedStatus("Reconnecting WiFi...", 0xFFCC66);
                 if (connectWiFi()) {
+                    ensureUkTimeConfigured();
                     setSharedStatus("WiFi connected", 0x38D39F);
                 } else {
                     setSharedStatus("WiFi not connected", 0xFF5A5A);
@@ -1001,6 +1508,21 @@ static void fplTask(void *) {
         if (lastPollMs == 0 || now - lastPollMs >= FPL_POLL_INTERVAL_MS) {
             lastPollMs = now;
             setSharedStatus("Fetching FPL points...", 0xFFCC66);
+
+            bool isLive = false;
+            int nextGw = 0;
+            bool hasDeadline = false;
+            time_t deadlineUtc = 0;
+            if (fetchGameweekState(isLive, nextGw, hasDeadline, deadlineUtc)) {
+                char gwStateBuf[48];
+                snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", isLive ? "yes" : "no", nextGw);
+                setSharedGwStateText(gwStateBuf);
+                setSharedGwTiming(nextGw, true, deadlineUtc, hasDeadline);
+                Serial.printf("GW state: live=%s next=%d\n", isLive ? "yes" : "no", nextGw);
+            } else {
+                setSharedGwStateText("GW live: ? | next: --");
+                setSharedGwTiming(0, false, 0, false);
+            }
 
             int gwPoints = 0;
             if (fetchAndPrintTeamSnapshot(gwPoints)) {
@@ -1061,6 +1583,8 @@ void setup() {
         }
     }
     setSharedStatus("Booting...", 0xA0A0A0);
+    setSharedGwStateText("GW live: ? | next: --");
+    setSharedGwTiming(0, false, 0, false);
 
 #if CONFIG_FREERTOS_UNICORE
     constexpr BaseType_t kUiCore = 0;
