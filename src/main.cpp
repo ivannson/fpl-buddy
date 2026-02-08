@@ -5,6 +5,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <lvgl.h>
 
 #include "fpl_config.h"
@@ -28,6 +30,19 @@ static lv_obj_t *labelPoints = nullptr;
 
 static uint32_t lastPollMs = 0;
 static uint32_t lastWifiRetryMs = 0;
+static TaskHandle_t uiTaskHandle = nullptr;
+static TaskHandle_t fplTaskHandle = nullptr;
+
+struct SharedUiState {
+    int gwPoints = 0;
+    bool hasGwPoints = false;
+    uint32_t statusColor = 0xFFFFFF;
+    char statusText[48] = "Booting...";
+    uint32_t version = 0;
+};
+
+static SharedUiState sharedUiState;
+static SemaphoreHandle_t sharedUiMutex = nullptr;
 
 struct TeamPick {
     struct LiveStats {
@@ -820,6 +835,47 @@ static void updatePoints(int points) {
     lv_label_set_text(labelPoints, buf);
 }
 
+static void setSharedStatus(const char *text, uint32_t colorHex) {
+    if (!sharedUiMutex) {
+        return;
+    }
+    if (xSemaphoreTake(sharedUiMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    strlcpy(sharedUiState.statusText, text, sizeof(sharedUiState.statusText));
+    sharedUiState.statusColor = colorHex;
+    sharedUiState.version++;
+    xSemaphoreGive(sharedUiMutex);
+}
+
+static void setSharedGwPoints(int points) {
+    if (!sharedUiMutex) {
+        return;
+    }
+    if (xSemaphoreTake(sharedUiMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    sharedUiState.gwPoints = points;
+    sharedUiState.hasGwPoints = true;
+    sharedUiState.version++;
+    xSemaphoreGive(sharedUiMutex);
+}
+
+static bool readSharedUiState(SharedUiState &out) {
+    if (!sharedUiMutex) {
+        return false;
+    }
+    if (xSemaphoreTake(sharedUiMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+
+    out = sharedUiState;
+    xSemaphoreGive(sharedUiMutex);
+    return true;
+}
+
 static void createUi() {
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0x000000), LV_PART_MAIN);
@@ -889,8 +945,7 @@ static bool connectWiFi() {
 
     const uint32_t startMs = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startMs < 15000) {
-        lv_timer_handler();
-        delay(100);
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -900,6 +955,65 @@ static bool connectWiFi() {
 
     Serial.println("WiFi connect timeout");
     return false;
+}
+
+static void uiTask(void *) {
+    SharedUiState localState;
+    uint32_t appliedVersion = 0;
+
+    for (;;) {
+        lv_timer_handler();
+
+        if (readSharedUiState(localState) && localState.version != appliedVersion) {
+            if (localState.hasGwPoints) {
+                updatePoints(localState.gwPoints);
+            }
+            updateStatus(localState.statusText, lv_color_hex(localState.statusColor));
+            appliedVersion = localState.version;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static void fplTask(void *) {
+    lastPollMs = 0;
+    lastWifiRetryMs = 0;
+    setSharedStatus("Connecting WiFi...", 0xFFCC66);
+
+    for (;;) {
+        const uint32_t now = millis();
+
+        if (WiFi.status() != WL_CONNECTED) {
+            if (lastWifiRetryMs == 0 || now - lastWifiRetryMs >= 10000) {
+                lastWifiRetryMs = now;
+                setSharedStatus("Reconnecting WiFi...", 0xFFCC66);
+                if (connectWiFi()) {
+                    setSharedStatus("WiFi connected", 0x38D39F);
+                } else {
+                    setSharedStatus("WiFi not connected", 0xFF5A5A);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        if (lastPollMs == 0 || now - lastPollMs >= FPL_POLL_INTERVAL_MS) {
+            lastPollMs = now;
+            setSharedStatus("Fetching FPL points...", 0xFFCC66);
+
+            int gwPoints = 0;
+            if (fetchAndPrintTeamSnapshot(gwPoints)) {
+                setSharedGwPoints(gwPoints);
+                setSharedStatus("FPL updated", 0x38D39F);
+                Serial.printf("FPL GW points: %d\n", gwPoints);
+            } else {
+                setSharedStatus("FPL fetch failed", 0xFF5A5A);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 void setup() {
@@ -939,49 +1053,34 @@ void setup() {
     lv_indev_set_read_cb(touchIndev, lvglTouchCb);
 
     createUi();
-
-    if (connectWiFi()) {
-        updateStatus("WiFi connected", lv_color_hex(0x38D39F));
-    } else {
-        updateStatus("WiFi not connected", lv_color_hex(0xFF5A5A));
+    sharedUiMutex = xSemaphoreCreateMutex();
+    if (!sharedUiMutex) {
+        Serial.println("Failed to create UI state mutex");
+        while (true) {
+            delay(1000);
+        }
     }
+    setSharedStatus("Booting...", 0xA0A0A0);
 
-    lastPollMs = 0;
-    lastWifiRetryMs = millis();
+#if CONFIG_FREERTOS_UNICORE
+    constexpr BaseType_t kUiCore = 0;
+    constexpr BaseType_t kFplCore = 0;
+#else
+    constexpr BaseType_t kUiCore = 1;
+    constexpr BaseType_t kFplCore = 0;
+#endif
+
+    xTaskCreatePinnedToCore(uiTask, "uiTask", 8192, nullptr, 2, &uiTaskHandle, kUiCore);
+    xTaskCreatePinnedToCore(fplTask, "fplTask", 12288, nullptr, 1, &fplTaskHandle, kFplCore);
+
+    if (!uiTaskHandle || !fplTaskHandle) {
+        Serial.println("Failed to create worker tasks");
+        while (true) {
+            delay(1000);
+        }
+    }
 }
 
 void loop() {
-    lv_timer_handler();
-
-    const uint32_t now = millis();
-
-    if (WiFi.status() != WL_CONNECTED) {
-        if (now - lastWifiRetryMs >= 10000) {
-            lastWifiRetryMs = now;
-            updateStatus("Reconnecting WiFi...", lv_color_hex(0xFFCC66));
-            if (connectWiFi()) {
-                updateStatus("WiFi connected", lv_color_hex(0x38D39F));
-            } else {
-                updateStatus("WiFi not connected", lv_color_hex(0xFF5A5A));
-            }
-        }
-        delay(5);
-        return;
-    }
-
-    if (lastPollMs == 0 || now - lastPollMs >= FPL_POLL_INTERVAL_MS) {
-        lastPollMs = now;
-        updateStatus("Fetching FPL points...", lv_color_hex(0xFFCC66));
-
-        int gwPoints = 0;
-        if (fetchAndPrintTeamSnapshot(gwPoints)) {
-            updatePoints(gwPoints);
-            updateStatus("FPL updated", lv_color_hex(0x38D39F));
-            Serial.printf("FPL GW points: %d\n", gwPoints);
-        } else {
-            updateStatus("FPL fetch failed", lv_color_hex(0xFF5A5A));
-        }
-    }
-
-    delay(5);
+    vTaskDelay(pdMS_TO_TICKS(1000));
 }
