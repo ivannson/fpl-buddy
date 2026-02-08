@@ -30,15 +30,42 @@ static uint32_t lastPollMs = 0;
 static uint32_t lastWifiRetryMs = 0;
 
 struct TeamPick {
+    struct LiveStats {
+        int totalPoints = 0;
+        int minutes = 0;
+        int goalsScored = 0;
+        int assists = 0;
+        int cleanSheets = 0;
+        int goalsConceded = 0;
+        int ownGoals = 0;
+        int penaltiesSaved = 0;
+        int penaltiesMissed = 0;
+        int yellowCards = 0;
+        int redCards = 0;
+        int saves = 0;
+        int bonus = 0;
+        int defensiveContributions = 0;
+    };
+
     int elementId = 0;
     int squadPosition = 0;
     int multiplier = 0;
     bool isCaptain = false;
     bool isViceCaptain = false;
-    int currentGwPoints = 0;
+    int elementType = 0;  // 1=GK, 2=DEF, 3=MID, 4=FWD
+    LiveStats live;
     String playerName;
     String positionName;
 };
+
+struct LastPickState {
+    bool valid = false;
+    int gw = 0;
+    int elementId = 0;
+    TeamPick::LiveStats live;
+};
+
+static LastPickState lastPickStates[16];
 
 static void setupHttpDefaults(HTTPClient &http) {
     http.setConnectTimeout(15000);
@@ -348,8 +375,22 @@ static bool fetchLivePointsForPicks(int gw, TeamPick *picks, size_t pickCount) {
     JsonObject elementFilter = elementsFilter.createNestedObject();
     elementFilter["id"] = true;
     elementFilter["stats"]["total_points"] = true;
+    elementFilter["stats"]["minutes"] = true;
+    elementFilter["stats"]["goals_scored"] = true;
+    elementFilter["stats"]["assists"] = true;
+    elementFilter["stats"]["clean_sheets"] = true;
+    elementFilter["stats"]["goals_conceded"] = true;
+    elementFilter["stats"]["own_goals"] = true;
+    elementFilter["stats"]["penalties_saved"] = true;
+    elementFilter["stats"]["penalties_missed"] = true;
+    elementFilter["stats"]["yellow_cards"] = true;
+    elementFilter["stats"]["red_cards"] = true;
+    elementFilter["stats"]["saves"] = true;
+    elementFilter["stats"]["bonus"] = true;
+    elementFilter["stats"]["defensive_contributions"] = true;
+    elementFilter["stats"]["defensive_contribution"] = true;
 
-    DynamicJsonDocument doc(140000);
+    DynamicJsonDocument doc(260000);
     String url = "https://fantasy.premierleague.com/api/event/";
     url += String(gw);
     url += "/live/";
@@ -365,15 +406,31 @@ static bool fetchLivePointsForPicks(int gw, TeamPick *picks, size_t pickCount) {
     }
 
     for (size_t i = 0; i < pickCount; ++i) {
-        picks[i].currentGwPoints = 0;
+        picks[i].live = TeamPick::LiveStats{};
     }
 
     for (JsonObject e : elements) {
         const int id = e["id"] | 0;
-        const int currentPts = e["stats"]["total_points"] | 0;
+        JsonObject stats = e["stats"];
         for (size_t i = 0; i < pickCount; ++i) {
             if (picks[i].elementId == id) {
-                picks[i].currentGwPoints = currentPts;
+                picks[i].live.totalPoints = stats["total_points"] | 0;
+                picks[i].live.minutes = stats["minutes"] | 0;
+                picks[i].live.goalsScored = stats["goals_scored"] | 0;
+                picks[i].live.assists = stats["assists"] | 0;
+                picks[i].live.cleanSheets = stats["clean_sheets"] | 0;
+                picks[i].live.goalsConceded = stats["goals_conceded"] | 0;
+                picks[i].live.ownGoals = stats["own_goals"] | 0;
+                picks[i].live.penaltiesSaved = stats["penalties_saved"] | 0;
+                picks[i].live.penaltiesMissed = stats["penalties_missed"] | 0;
+                picks[i].live.yellowCards = stats["yellow_cards"] | 0;
+                picks[i].live.redCards = stats["red_cards"] | 0;
+                picks[i].live.saves = stats["saves"] | 0;
+                picks[i].live.bonus = stats["bonus"] | 0;
+                picks[i].live.defensiveContributions = stats["defensive_contributions"] | 0;
+                if (picks[i].live.defensiveContributions == 0) {
+                    picks[i].live.defensiveContributions = stats["defensive_contribution"] | 0;
+                }
                 break;
             }
         }
@@ -428,6 +485,7 @@ static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
             }
             picks[i].playerName = e["web_name"] | "unknown";
             const int typeId = e["element_type"] | 0;
+            picks[i].elementType = typeId;
             picks[i].positionName = "?";
             for (size_t j = 0; j < typeCount; ++j) {
                 if (typeNames[j].id == typeId) {
@@ -442,6 +500,216 @@ static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
     return true;
 }
 #endif
+
+static const char *pickDisplayName(const TeamPick &pick, char *buf, size_t bufSize) {
+    if (pick.playerName.length()) {
+        return pick.playerName.c_str();
+    }
+    snprintf(buf, bufSize, "element %d", pick.elementId);
+    return buf;
+}
+
+static int goalPointsForElementType(int elementType) {
+    if (elementType == 1) {
+        return 10;
+    }
+    if (elementType == 2) {
+        return 6;
+    }
+    if (elementType == 3) {
+        return 5;
+    }
+    if (elementType == 4) {
+        return 4;
+    }
+    return 0;
+}
+
+static int cleanSheetPointsForElementType(int elementType) {
+    if (elementType == 1 || elementType == 2) {
+        return 4;
+    }
+    if (elementType == 3) {
+        return 1;
+    }
+    return 0;
+}
+
+static int defensiveContributionThresholdForElementType(int elementType) {
+    if (elementType == 2) {
+        return 10;
+    }
+    if (elementType == 3 || elementType == 4) {
+        return 12;
+    }
+    return 0;
+}
+
+static int savesThresholdForElementType(int elementType) {
+    if (elementType == 1) {
+        return 3;
+    }
+    return 0;
+}
+
+static void notifyEvent(const char *name, int pts, const char *what) {
+    Serial.printf("[FPL EVENT] %s %+d pt%s, %s\n", name, pts, (pts == 1 || pts == -1) ? "" : "s", what);
+}
+
+static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pickCount) {
+    for (size_t i = 0; i < pickCount; ++i) {
+        const TeamPick &p = picks[i];
+        LastPickState *state = nullptr;
+        for (size_t s = 0; s < 16; ++s) {
+            if (lastPickStates[s].valid && lastPickStates[s].gw == gw && lastPickStates[s].elementId == p.elementId) {
+                state = &lastPickStates[s];
+                break;
+            }
+        }
+
+        // first observation for this player in this GW
+        if (!state) {
+            for (size_t s = 0; s < 16; ++s) {
+                if (!lastPickStates[s].valid || lastPickStates[s].gw != gw) {
+                    lastPickStates[s].valid = true;
+                    lastPickStates[s].gw = gw;
+                    lastPickStates[s].elementId = p.elementId;
+                    lastPickStates[s].live = p.live;
+                    state = &lastPickStates[s];
+                    break;
+                }
+            }
+            continue;
+        }
+
+        const TeamPick::LiveStats &prev = state->live;
+        const TeamPick::LiveStats &curr = p.live;
+        const int pointDelta = curr.totalPoints - prev.totalPoints;
+        if (pointDelta == 0) {
+            state->live = curr;
+            continue;
+        }
+
+        char nameBuf[24];
+        const char *name = pickDisplayName(p, nameBuf, sizeof(nameBuf));
+        int explained = 0;
+
+        if (prev.minutes < 1 && curr.minutes >= 1) {
+            notifyEvent(name, +1, "entered match (1-59 mins)");
+            explained += 1;
+        }
+        if (prev.minutes < 60 && curr.minutes >= 60) {
+            notifyEvent(name, +1, "60 mins played");
+            explained += 1;
+        }
+
+        const int goalDiff = curr.goalsScored - prev.goalsScored;
+        if (goalDiff > 0) {
+            const int pts = goalPointsForElementType(p.elementType) * goalDiff;
+            const char *what = (goalDiff == 1) ? "goal scored" : "goals scored";
+            notifyEvent(name, pts, what);
+            explained += pts;
+        }
+
+        const int assistDiff = curr.assists - prev.assists;
+        if (assistDiff > 0) {
+            const int pts = 3 * assistDiff;
+            const char *what = (assistDiff == 1) ? "assist" : "assists";
+            notifyEvent(name, pts, what);
+            explained += pts;
+        }
+
+        const int csDiff = curr.cleanSheets - prev.cleanSheets;
+        if (csDiff > 0) {
+            const int pts = cleanSheetPointsForElementType(p.elementType) * csDiff;
+            if (pts != 0) {
+                notifyEvent(name, pts, "clean sheet");
+                explained += pts;
+            }
+        }
+
+        const int savesThreshold = savesThresholdForElementType(p.elementType);
+        if (savesThreshold > 0) {
+            const int saveChunksPrev = prev.saves / savesThreshold;
+            const int saveChunksCurr = curr.saves / savesThreshold;
+            const int chunkDiff = saveChunksCurr - saveChunksPrev;
+            if (chunkDiff > 0) {
+                notifyEvent(name, chunkDiff, "save points (every 3 saves)");
+                explained += chunkDiff;
+            }
+        }
+
+        const int psDiff = curr.penaltiesSaved - prev.penaltiesSaved;
+        if (psDiff > 0) {
+            const int pts = 5 * psDiff;
+            notifyEvent(name, pts, "penalty saved");
+            explained += pts;
+        }
+
+        const int dcThreshold = defensiveContributionThresholdForElementType(p.elementType);
+        if (dcThreshold > 0) {
+            const int dcChunksPrev = prev.defensiveContributions / dcThreshold;
+            const int dcChunksCurr = curr.defensiveContributions / dcThreshold;
+            const int chunkDiff = dcChunksCurr - dcChunksPrev;
+            if (chunkDiff > 0) {
+                const int pts = 2 * chunkDiff;
+                notifyEvent(name, pts, "defensive contributions threshold");
+                explained += pts;
+            }
+        }
+
+        const int bonusDiff = curr.bonus - prev.bonus;
+        if (bonusDiff > 0) {
+            notifyEvent(name, bonusDiff, "bonus points");
+            explained += bonusDiff;
+        }
+
+        if (p.elementType == 1 || p.elementType == 2) {
+            const int gcChunksPrev = prev.goalsConceded / 2;
+            const int gcChunksCurr = curr.goalsConceded / 2;
+            const int gcChunkDiff = gcChunksCurr - gcChunksPrev;
+            if (gcChunkDiff > 0) {
+                notifyEvent(name, -gcChunkDiff, "goals conceded deduction");
+                explained -= gcChunkDiff;
+            }
+        }
+
+        const int pmDiff = curr.penaltiesMissed - prev.penaltiesMissed;
+        if (pmDiff > 0) {
+            const int pts = -2 * pmDiff;
+            notifyEvent(name, pts, "penalty missed");
+            explained += pts;
+        }
+
+        const int ycDiff = curr.yellowCards - prev.yellowCards;
+        if (ycDiff > 0) {
+            const int pts = -ycDiff;
+            notifyEvent(name, pts, "yellow card");
+            explained += pts;
+        }
+
+        const int rcDiff = curr.redCards - prev.redCards;
+        if (rcDiff > 0) {
+            const int pts = -3 * rcDiff;
+            notifyEvent(name, pts, "red card");
+            explained += pts;
+        }
+
+        const int ogDiff = curr.ownGoals - prev.ownGoals;
+        if (ogDiff > 0) {
+            const int pts = -2 * ogDiff;
+            notifyEvent(name, pts, "own goal");
+            explained += pts;
+        }
+
+        if (explained != pointDelta) {
+            Serial.printf("[FPL EVENT] %s %+d pts total change (unattributed %+d)\n", name, pointDelta,
+                          pointDelta - explained);
+        }
+
+        state->live = curr;
+    }
+}
 
 static bool fetchAndPrintTeamSnapshot(int &gwPointsOut) {
     int currentGw = 0;
@@ -463,9 +731,11 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut) {
     hasPlayerMeta = fetchPlayerMetaForPicks(picks, pickCount);
 #endif
 
+    detectAndNotifyPointChanges(currentGw, picks, pickCount);
+
     int computedGwPoints = 0;
     for (size_t i = 0; i < pickCount; ++i) {
-        computedGwPoints += picks[i].currentGwPoints * picks[i].multiplier;
+        computedGwPoints += picks[i].live.totalPoints * picks[i].multiplier;
     }
     gwPointsOut = computedGwPoints;
 
@@ -482,16 +752,16 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut) {
     for (size_t i = 0; i < pickCount; ++i) {
         TeamPick &p = picks[i];
         const char *slot = (p.squadPosition <= 11) ? "XI" : "BENCH";
-        const int effectivePoints = p.currentGwPoints * p.multiplier;
+        const int effectivePoints = p.live.totalPoints * p.multiplier;
         if (hasPlayerMeta) {
             Serial.printf("  [%2d] %-5s | %-15s | %-3s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d\n",
                           p.squadPosition, slot,
                           p.playerName.length() ? p.playerName.c_str() : "unknown",
-                          p.positionName.length() ? p.positionName.c_str() : "?", p.currentGwPoints, p.elementId,
+                          p.positionName.length() ? p.positionName.c_str() : "?", p.live.totalPoints, p.elementId,
                           p.multiplier, p.isCaptain ? " C" : "", p.isViceCaptain ? " VC" : "", effectivePoints);
         } else {
             Serial.printf("  [%2d] %-5s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d\n", p.squadPosition, slot,
-                          p.currentGwPoints, p.elementId, p.multiplier, p.isCaptain ? " C" : "",
+                          p.live.totalPoints, p.elementId, p.multiplier, p.isCaptain ? " C" : "",
                           p.isViceCaptain ? " VC" : "", effectivePoints);
         }
     }
