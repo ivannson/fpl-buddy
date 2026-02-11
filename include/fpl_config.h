@@ -25,3 +25,16 @@
 #ifndef FPL_LIVE_PSRAM_MAX_BYTES
 #define FPL_LIVE_PSRAM_MAX_BYTES (2UL * 1024UL * 1024UL)
 #endif
+
+// ArduinoJson document capacity for parsing /event/{gw}/live/ payload.
+// Increase when using server `explain` breakdown to avoid NoMemory.
+#ifndef FPL_LIVE_JSON_DOC_CAPACITY
+#define FPL_LIVE_JSON_DOC_CAPACITY 700000UL
+#endif
+
+// Notification source:
+// 1 = use server event breakdown (`/event/{gw}/live` -> `explain`)
+// 0 = use inferred local logic from stat deltas
+#ifndef FPL_USE_SERVER_EVENT_BREAKDOWN
+#define FPL_USE_SERVER_EVENT_BREAKDOWN 1
+#endif
