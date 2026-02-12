@@ -39,8 +39,8 @@ static uint32_t lastWifiRetryMs = 0;
 static TaskHandle_t uiTaskHandle = nullptr;
 static TaskHandle_t fplTaskHandle = nullptr;
 
-static constexpr int kKitWidth = 72;
-static constexpr int kKitHeight = 72;
+static constexpr int kKitWidth = 110;
+static constexpr int kKitHeight = 145;
 static constexpr size_t kKitRgb565Bytes = kKitWidth * kKitHeight * 2;
 static constexpr size_t kMaxUiEvents = 24;
 static constexpr size_t kMaxPopupEvents = 8;
@@ -231,11 +231,67 @@ struct LastPickState {
     TeamPick::LiveStats live;
 };
 
+struct TeamSnapshot {
+    int currentGw = 0;
+    int overallRank = 0;
+    int overallPoints = 0;
+    int gwPoints = 0;
+    bool hasPlayerMeta = false;
+    String activeChip;
+    TeamPick picks[16];
+    size_t pickCount = 0;
+};
+
+struct DemoState {
+    bool enabled = false;
+    bool seeded = false;
+    TeamPick picks[16];
+    TeamPick seededPicks[16];
+    size_t pickCount = 0;
+    int currentGw = 0;
+    int nextGw = 0;
+    bool hasNextGw = false;
+    bool isLiveGw = false;
+    bool hasDeadline = false;
+    time_t deadlineUtc = 0;
+    int gwPoints = 0;
+    int seededGwPoints = 0;
+    int totalPoints = 0;
+    int seededTotalPoints = 0;
+    int overallRank = 0;
+    int rankDiff = 0;
+    bool hasRankData = false;
+};
+
 static LastPickState lastPickStates[16];
+static DemoState demoState;
+static SemaphoreHandle_t demoMutex = nullptr;
+static constexpr size_t kSerialLineMax = 192;
+static char serialLineBuffer[kSerialLineMax];
+static size_t serialLineLen = 0;
 static void parseExplainIntoBreakdown(const JsonVariantConst &explainVar, TeamPick::LiveStats &live);
 static void pushUiEvent(const UiEventItem &event);
 static void updateSharedSquadFromPicks(const TeamPick *picks, size_t pickCount);
 static void sanitizeUtf8ToAscii(const char *in, char *out, size_t outLen);
+static int computeGwPointsFromPicks(const TeamPick *picks, size_t pickCount);
+static bool fetchTeamSnapshot(TeamSnapshot &out);
+static void clearUiEvents();
+static bool isDemoModeEnabled();
+static void publishDemoStateToUi(const DemoState &state);
+static bool copyDemoState(DemoState &out);
+static void printDemoHelp();
+static void printDemoStateSummary(const DemoState &state);
+static void printDemoSquad(const DemoState &state);
+static bool parseIntToken(const char *token, int &out);
+static bool parseBoolToken(const char *token, bool &out);
+static void toLowerAscii(char *text);
+static size_t splitTokens(char *line, char **tokens, size_t maxTokens);
+static TeamPick *findPickBySquadSlot(TeamPick *picks, size_t pickCount, int slot);
+static int canonicalPointsForLive(const TeamPick &pick, const TeamPick::LiveStats &live, bool &okOut);
+static bool applyDemoEventToPick(TeamPick &pick, const char *eventType, int count, int &pointDeltaOut,
+                                 const char *&labelOut);
+static void handleSerialCommandLine(char *line);
+static void processSerialInput();
 
 static void setupHttpDefaults(HTTPClient &http) {
     http.setConnectTimeout(15000);
@@ -769,6 +825,37 @@ static void slugifyTeamName(const char *name, char *out, size_t outLen) {
     out[idx] = '\0';
 }
 
+static void normalizeKitTeamSlug(char *slug, size_t slugLen) {
+    if (!slug || slugLen == 0 || !slug[0]) {
+        return;
+    }
+    struct TeamSlugAlias {
+        const char *apiSlug;
+        const char *kitSlug;
+    };
+    static const TeamSlugAlias aliases[] = {
+        {"afc_bournemouth", "bournemouth"},
+        {"brighton_and_hove_albion", "brighton"},
+        {"manchester_city", "man_city"},
+        {"manchester_utd", "man_utd"},
+        {"manchester_united", "man_utd"},
+        {"newcastle_utd", "newcastle"},
+        {"newcastle_united", "newcastle"},
+        {"nott_m_forest", "nottingham_forest"},
+        {"nottm_forest", "nottingham_forest"},
+        {"tottenham_hotspur", "tottenham"},
+        {"west_ham_united", "west_ham"},
+        {"wolverhampton_wanderers", "wolves"},
+    };
+
+    for (const TeamSlugAlias &alias : aliases) {
+        if (strcmp(slug, alias.apiSlug) == 0) {
+            strlcpy(slug, alias.kitSlug, slugLen);
+            return;
+        }
+    }
+}
+
 static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
     DynamicJsonDocument filter(1152);
     JsonArray elementsFilter = filter.createNestedArray("elements");
@@ -824,6 +911,7 @@ static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
         }
         teamNames[teamCount].id = t["id"] | 0;
         slugifyTeamName(t["name"] | "", teamNames[teamCount].slug, sizeof(teamNames[teamCount].slug));
+        normalizeKitTeamSlug(teamNames[teamCount].slug, sizeof(teamNames[teamCount].slug));
         ++teamCount;
     }
 
@@ -1183,22 +1271,22 @@ static const char *iconForEvent(const char *what, int pts) {
     if (!what) {
         return pts >= 0 ? "+" : "-";
     }
-    if (strstr(what, "goal")) {
+    if (strstr(what, "goal") || strstr(what, "GOAL")) {
         return "G";
     }
-    if (strstr(what, "assist")) {
+    if (strstr(what, "assist") || strstr(what, "ASSIST")) {
         return "A";
     }
-    if (strstr(what, "clean")) {
+    if (strstr(what, "clean") || strstr(what, "CLEAN")) {
         return "CS";
     }
-    if (strstr(what, "save")) {
+    if (strstr(what, "save") || strstr(what, "SAVE")) {
         return "SV";
     }
-    if (strstr(what, "yellow")) {
+    if (strstr(what, "yellow") || strstr(what, "YELLOW")) {
         return "YC";
     }
-    if (strstr(what, "red")) {
+    if (strstr(what, "red") || strstr(what, "RED")) {
         return "RC";
     }
     return pts >= 0 ? "+" : "-";
@@ -1265,19 +1353,39 @@ static void detectAndNotifyPointChangesFromBreakdown(int gw, const TeamPick *pic
             }
         };
 
-        emitDiff(prev.brMinutesPts, curr.brMinutesPts, "minutes played");
-        emitDiff(prev.brGoalsPts, curr.brGoalsPts, "goal scored");
-        emitDiff(prev.brAssistsPts, curr.brAssistsPts, "assist");
-        emitDiff(prev.brCleanSheetPts, curr.brCleanSheetPts, "clean sheet");
-        emitDiff(prev.brSavesPts, curr.brSavesPts, "saves");
-        emitDiff(prev.brPenSavedPts, curr.brPenSavedPts, "penalty saved");
-        emitDiff(prev.brDefContribPts, curr.brDefContribPts, "defensive contributions");
-        emitDiff(prev.brBonusPts, curr.brBonusPts, "bonus points");
-        emitDiff(prev.brGoalsConcededPts, curr.brGoalsConcededPts, "goals conceded deduction");
-        emitDiff(prev.brPenMissedPts, curr.brPenMissedPts, "penalty missed");
-        emitDiff(prev.brYellowPts, curr.brYellowPts, "yellow card");
-        emitDiff(prev.brRedPts, curr.brRedPts, "red card");
-        emitDiff(prev.brOwnGoalPts, curr.brOwnGoalPts, "own goal");
+        const int minutePtsDiff = curr.brMinutesPts - prev.brMinutesPts;
+        if (minutePtsDiff > 0) {
+            int minutePtsLeft = minutePtsDiff;
+            if (prev.minutes < 1 && curr.minutes >= 1 && minutePtsLeft > 0) {
+                notifyEvent(p, +1, "PLAYING!");
+                explained += 1;
+                minutePtsLeft -= 1;
+            }
+            if (prev.minutes < 60 && curr.minutes >= 60 && minutePtsLeft > 0) {
+                notifyEvent(p, +1, "60+ mins!");
+                explained += 1;
+                minutePtsLeft -= 1;
+            }
+            if (minutePtsLeft != 0) {
+                notifyEvent(p, minutePtsLeft, "60+ mins!");
+                explained += minutePtsLeft;
+            }
+        } else if (minutePtsDiff < 0) {
+            notifyEvent(p, minutePtsDiff, "60+ mins!");
+            explained += minutePtsDiff;
+        }
+        emitDiff(prev.brGoalsPts, curr.brGoalsPts, "GOAL!");
+        emitDiff(prev.brAssistsPts, curr.brAssistsPts, "ASSIST!");
+        emitDiff(prev.brCleanSheetPts, curr.brCleanSheetPts, "CLEAN SHEET!");
+        emitDiff(prev.brSavesPts, curr.brSavesPts, "SAVE BONUS!");
+        emitDiff(prev.brPenSavedPts, curr.brPenSavedPts, "PEN SAVE!");
+        emitDiff(prev.brDefContribPts, curr.brDefContribPts, "DEF CON!");
+        emitDiff(prev.brBonusPts, curr.brBonusPts, "BONUS PTS!");
+        emitDiff(prev.brGoalsConcededPts, curr.brGoalsConcededPts, "goals against");
+        emitDiff(prev.brPenMissedPts, curr.brPenMissedPts, "PEN MISS!");
+        emitDiff(prev.brYellowPts, curr.brYellowPts, "YELLOW!");
+        emitDiff(prev.brRedPts, curr.brRedPts, "RED!");
+        emitDiff(prev.brOwnGoalPts, curr.brOwnGoalPts, "OWN GOAL!");
         emitDiff(prev.brOtherPts, curr.brOtherPts, "other scoring rule");
 
         if (explained != pointDelta) {
@@ -1328,25 +1436,25 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
         int explained = 0;
 
         if (prev.minutes < 1 && curr.minutes >= 1) {
-            notifyEvent(p, +1, "entered match (1-59 mins)");
+            notifyEvent(p, +1, "PLAYING!");
             explained += 1;
         }
         if (prev.minutes < 60 && curr.minutes >= 60) {
-            notifyEvent(p, +1, "60 mins played");
+            notifyEvent(p, +1, "60+ mins!");
             explained += 1;
         }
 
         const int goalDiff = curr.goalsScored - prev.goalsScored;
         if (goalDiff > 0) {
             const int pts = goalPointsForElementType(p.elementType) * goalDiff;
-            notifyEvent(p, pts, (goalDiff == 1) ? "goal scored" : "goals scored");
+            notifyEvent(p, pts, "GOAL!");
             explained += pts;
         }
 
         const int assistDiff = curr.assists - prev.assists;
         if (assistDiff > 0) {
             const int pts = 3 * assistDiff;
-            notifyEvent(p, pts, (assistDiff == 1) ? "assist" : "assists");
+            notifyEvent(p, pts, "ASSIST!");
             explained += pts;
         }
 
@@ -1354,7 +1462,7 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
         if (csDiff > 0) {
             const int pts = cleanSheetPointsForElementType(p.elementType) * csDiff;
             if (pts != 0) {
-                notifyEvent(p, pts, "clean sheet");
+                notifyEvent(p, pts, "CLEAN SHEET!");
                 explained += pts;
             }
         }
@@ -1365,7 +1473,7 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
             const int saveChunksCurr = curr.saves / savesThreshold;
             const int chunkDiff = saveChunksCurr - saveChunksPrev;
             if (chunkDiff > 0) {
-                notifyEvent(p, chunkDiff, "save points (every 3 saves)");
+                notifyEvent(p, chunkDiff, "SAVE BONUS!");
                 explained += chunkDiff;
             }
         }
@@ -1373,7 +1481,7 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
         const int psDiff = curr.penaltiesSaved - prev.penaltiesSaved;
         if (psDiff > 0) {
             const int pts = 5 * psDiff;
-            notifyEvent(p, pts, "penalty saved");
+            notifyEvent(p, pts, "PEN SAVE!");
             explained += pts;
         }
 
@@ -1384,14 +1492,14 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
             const int chunkDiff = dcChunksCurr - dcChunksPrev;
             if (chunkDiff > 0) {
                 const int pts = 2 * chunkDiff;
-                notifyEvent(p, pts, "defensive contributions threshold");
+                notifyEvent(p, pts, "DEF CON!");
                 explained += pts;
             }
         }
 
         const int bonusDiff = curr.bonus - prev.bonus;
         if (bonusDiff > 0) {
-            notifyEvent(p, bonusDiff, "bonus points");
+            notifyEvent(p, bonusDiff, "BONUS PTS!");
             explained += bonusDiff;
         }
 
@@ -1400,7 +1508,7 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
             const int gcChunksCurr = curr.goalsConceded / 2;
             const int gcChunkDiff = gcChunksCurr - gcChunksPrev;
             if (gcChunkDiff > 0) {
-                notifyEvent(p, -gcChunkDiff, "goals conceded deduction");
+                notifyEvent(p, -gcChunkDiff, "goals against");
                 explained -= gcChunkDiff;
             }
         }
@@ -1408,28 +1516,28 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
         const int pmDiff = curr.penaltiesMissed - prev.penaltiesMissed;
         if (pmDiff > 0) {
             const int pts = -2 * pmDiff;
-            notifyEvent(p, pts, "penalty missed");
+            notifyEvent(p, pts, "PEN MISS!");
             explained += pts;
         }
 
         const int ycDiff = curr.yellowCards - prev.yellowCards;
         if (ycDiff > 0) {
             const int pts = -ycDiff;
-            notifyEvent(p, pts, "yellow card");
+            notifyEvent(p, pts, "YELLOW!");
             explained += pts;
         }
 
         const int rcDiff = curr.redCards - prev.redCards;
         if (rcDiff > 0) {
             const int pts = -3 * rcDiff;
-            notifyEvent(p, pts, "red card");
+            notifyEvent(p, pts, "RED!");
             explained += pts;
         }
 
         const int ogDiff = curr.ownGoals - prev.ownGoals;
         if (ogDiff > 0) {
             const int pts = -2 * ogDiff;
-            notifyEvent(p, pts, "own goal");
+            notifyEvent(p, pts, "OWN GOAL!");
             explained += pts;
         }
 
@@ -1444,7 +1552,18 @@ static void detectAndNotifyPointChanges(int gw, const TeamPick *picks, size_t pi
     }
 }
 
-static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = nullptr, int *overallPointsOut = nullptr) {
+static int computeGwPointsFromPicks(const TeamPick *picks, size_t pickCount) {
+    int computedGwPoints = 0;
+    for (size_t i = 0; i < pickCount; ++i) {
+        bool projectedBonusAdded = false;
+        bool bonusIncluded = false;
+        const int adjusted = adjustedLivePointsWithProjectedBonus(picks[i], projectedBonusAdded, bonusIncluded);
+        computedGwPoints += adjusted * picks[i].multiplier;
+    }
+    return computedGwPoints;
+}
+
+static bool fetchTeamSnapshot(TeamSnapshot &out) {
     int currentGw = 0;
     int overallRank = 0;
     int overallPoints = 0;
@@ -1452,61 +1571,70 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = null
         return false;
     }
 
-    TeamPick picks[16];
     size_t pickCount = 0;
     String activeChip;
-    if (!fetchPicksForGw(currentGw, picks, 16, pickCount, activeChip)) {
+    if (!fetchPicksForGw(currentGw, out.picks, 16, pickCount, activeChip)) {
         return false;
     }
-    if (!fetchLivePointsForPicks(currentGw, picks, pickCount)) {
+    if (!fetchLivePointsForPicks(currentGw, out.picks, pickCount)) {
         return false;
     }
+
     bool hasPlayerMeta = false;
 #if FPL_ENABLE_NAME_LOOKUP
-    hasPlayerMeta = fetchPlayerMetaForPicks(picks, pickCount);
+    hasPlayerMeta = fetchPlayerMetaForPicks(out.picks, pickCount);
 #endif
-    updateSharedSquadFromPicks(picks, pickCount);
+
+    out.currentGw = currentGw;
+    out.overallRank = overallRank;
+    out.overallPoints = overallPoints;
+    out.pickCount = pickCount;
+    out.activeChip = activeChip;
+    out.hasPlayerMeta = hasPlayerMeta;
+    out.gwPoints = computeGwPointsFromPicks(out.picks, out.pickCount);
+    return true;
+}
+
+static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = nullptr, int *overallPointsOut = nullptr) {
+    TeamSnapshot snapshot;
+    if (!fetchTeamSnapshot(snapshot)) {
+        return false;
+    }
+
+    updateSharedSquadFromPicks(snapshot.picks, snapshot.pickCount);
 
     if (kUseServerEventBreakdown) {
-        detectAndNotifyPointChangesFromBreakdown(currentGw, picks, pickCount);
+        detectAndNotifyPointChangesFromBreakdown(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
     } else {
-        detectAndNotifyPointChanges(currentGw, picks, pickCount);
+        detectAndNotifyPointChanges(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
     }
-
-    int adjustedPoints[16];
-    bool projectedBonusAdded[16];
-    bool bonusIncluded[16];
-    int computedGwPoints = 0;
-    for (size_t i = 0; i < pickCount; ++i) {
-        adjustedPoints[i] =
-            adjustedLivePointsWithProjectedBonus(picks[i], projectedBonusAdded[i], bonusIncluded[i]);
-        computedGwPoints += adjustedPoints[i] * picks[i].multiplier;
-    }
-    gwPointsOut = computedGwPoints;
+    gwPointsOut = snapshot.gwPoints;
 
     Serial.println("\n=== FPL Team Snapshot ===");
-    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", FPL_ENTRY_ID, currentGw, gwPointsOut);
-    if (overallRank > 0) {
-        Serial.printf("Overall rank: %d\n", overallRank);
+    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", FPL_ENTRY_ID, snapshot.currentGw, gwPointsOut);
+    if (snapshot.overallRank > 0) {
+        Serial.printf("Overall rank: %d\n", snapshot.overallRank);
     }
-    Serial.printf("Active chip: %s\n", activeChip.c_str());
+    Serial.printf("Active chip: %s\n", snapshot.activeChip.c_str());
 #if FPL_ENABLE_NAME_LOOKUP
-    Serial.printf("Name lookup: %s\n", hasPlayerMeta ? "ok" : "fallback-id-only");
+    Serial.printf("Name lookup: %s\n", snapshot.hasPlayerMeta ? "ok" : "fallback-id-only");
 #else
     Serial.println("Name lookup: disabled");
 #endif
     Serial.println("Players:");
 
-    for (size_t i = 0; i < pickCount; ++i) {
-        TeamPick &p = picks[i];
+    for (size_t i = 0; i < snapshot.pickCount; ++i) {
+        TeamPick &p = snapshot.picks[i];
         const char *slot = (p.squadPosition <= 11) ? "XI" : "BENCH";
-        const int currPoints = adjustedPoints[i];
+        bool projectedBonusAdded = false;
+        bool bonusIncluded = false;
+        const int currPoints = adjustedLivePointsWithProjectedBonus(p, projectedBonusAdded, bonusIncluded);
         const int effectivePoints = currPoints * p.multiplier;
         const bool showBonusState = p.live.bonus > 0;
-        const char *bonusState = projectedBonusAdded[i] ? "proj" : (bonusIncluded[i] ? "in" : "unk");
+        const char *bonusState = projectedBonusAdded ? "proj" : (bonusIncluded ? "in" : "unk");
         char breakdown[256];
-        formatPointsBreakdown(p, projectedBonusAdded[i], bonusIncluded[i], currPoints, breakdown, sizeof(breakdown));
-        if (hasPlayerMeta) {
+        formatPointsBreakdown(p, projectedBonusAdded, bonusIncluded, currPoints, breakdown, sizeof(breakdown));
+        if (snapshot.hasPlayerMeta) {
             Serial.printf("  [%2d] %-5s | %-15s | %-3s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d",
                           p.squadPosition, slot,
                           p.playerName.length() ? p.playerName.c_str() : "unknown",
@@ -1531,10 +1659,10 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = null
     Serial.println("=========================\n");
 
     if (currentGwOut) {
-        *currentGwOut = currentGw;
+        *currentGwOut = snapshot.currentGw;
     }
     if (overallPointsOut) {
-        *overallPointsOut = overallPoints;
+        *overallPointsOut = snapshot.overallPoints;
     }
 
     return true;
@@ -1777,24 +1905,33 @@ static void sanitizeUtf8ToAscii(const char *in, char *out, size_t outLen) {
 
 static bool loadKitImage(const char *team, const char *type) {
     if (!team || !team[0] || !type || !type[0]) {
+        Serial.printf("[KIT] invalid args team='%s' type='%s'\n", team ? team : "(null)", type ? type : "(null)");
         return false;
     }
     char path[96];
-    snprintf(path, sizeof(path), "/kits/%s_%s_72x72.rgb565", team, type);
+    snprintf(path, sizeof(path), "/kits/%s_%s_%dx%d.rgb565", team, type, kKitWidth, kKitHeight);
 
     File f = LittleFS.open(path, "r");
     if (!f) {
+        Serial.printf("[KIT] missing file: %s\n", path);
         return false;
     }
     const size_t bytes = f.read(kitImageBuffer, kKitRgb565Bytes);
     f.close();
     if (bytes != kKitRgb565Bytes) {
+        Serial.printf("[KIT] short read: %s (%u/%u)\n", path, static_cast<unsigned>(bytes),
+                      static_cast<unsigned>(kKitRgb565Bytes));
         return false;
     }
+    Serial.printf("[KIT] loaded: %s\n", path);
     return true;
 }
 
 static bool resolveAndLoadKitImage(const UiEventItem &event) {
+    if (!event.team[0]) {
+        Serial.printf("[KIT] event missing team slug: player='%s' label='%s'\n", event.player, event.label);
+        return false;
+    }
     const char *type = event.isGk ? "gk" : "outfield";
     if (loadKitImage(event.team, type)) {
         return true;
@@ -2126,13 +2263,13 @@ static void createUi(void) {
     kitImageDsc.data = kitImageBuffer;
     ui.popupKit = lv_image_create(ui.screenPopup);
     lv_image_set_src(ui.popupKit, &kitImageDsc);
-    lv_obj_align(ui.popupKit, LV_ALIGN_CENTER, 0, -36);
+    lv_obj_align(ui.popupKit, LV_ALIGN_CENTER, 0, -24);
     ui.popupPlayer = createLabel(ui.screenPopup, kFontLarge, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupPlayer, LV_ALIGN_CENTER, 0, 52);
+    lv_obj_align(ui.popupPlayer, LV_ALIGN_CENTER, 0, 68);
     ui.popupDelta = createLabel(ui.screenPopup, &lv_font_montserrat_28, kColorAccentGreen, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupDelta, LV_ALIGN_CENTER, 0, 102);
+    lv_obj_align(ui.popupDelta, LV_ALIGN_CENTER, 0, 118);
     ui.popupTotal = createLabel(ui.screenPopup, kFontBody, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupTotal, LV_ALIGN_CENTER, 0, 138);
+    lv_obj_align(ui.popupTotal, LV_ALIGN_CENTER, 0, 154);
 
     ui.eventsList = createOverlayListScreen(ui.screenEvents, "EVENTS", backFromEventsCb);
     ui.squadList = createOverlayListScreen(ui.screenSquad, "MY SQUAD", backFromSquadCb);
@@ -2314,6 +2451,22 @@ static bool popUiPopup(UiEventItem &eventOut) {
     return true;
 }
 
+static void clearUiEvents() {
+    if (!uiRuntimeMutex) {
+        return;
+    }
+    if (xSemaphoreTake(uiRuntimeMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+
+    uiRuntimeState.recentEventCount = 0;
+    uiRuntimeState.popupHead = 0;
+    uiRuntimeState.popupTail = 0;
+    uiRuntimeState.popupCount = 0;
+    uiRuntimeState.eventVersion++;
+    xSemaphoreGive(uiRuntimeMutex);
+}
+
 static void updateSharedSquadFromPicks(const TeamPick *picks, size_t pickCount) {
     if (!uiRuntimeMutex) {
         return;
@@ -2458,6 +2611,625 @@ static bool connectWiFi() {
 
     Serial.println("WiFi connect timeout");
     return false;
+}
+
+static bool isDemoModeEnabled() {
+    if (!demoMutex) {
+        return false;
+    }
+    if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+    const bool enabled = demoState.enabled;
+    xSemaphoreGive(demoMutex);
+    return enabled;
+}
+
+static bool copyDemoState(DemoState &out) {
+    if (!demoMutex) {
+        return false;
+    }
+    if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    out = demoState;
+    xSemaphoreGive(demoMutex);
+    return true;
+}
+
+static void publishDemoStateToUi(const DemoState &state) {
+    setSharedGwPoints(state.gwPoints);
+    setSharedRankData(state.overallRank, state.rankDiff, state.hasRankData);
+    setSharedTotalPoints(state.totalPoints, state.seeded);
+    setSharedGameweekContext(state.isLiveGw, state.currentGw, state.nextGw, state.hasNextGw, state.deadlineUtc, state.hasDeadline);
+
+    char gwStateBuf[48];
+    snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", state.isLiveGw ? "yes" : "no", state.nextGw);
+    setSharedGwStateText(gwStateBuf);
+    setSharedFreshness(false, millis());
+    updateSharedSquadFromPicks(state.picks, state.pickCount);
+}
+
+static bool parseIntToken(const char *token, int &out) {
+    if (!token || !token[0]) {
+        return false;
+    }
+    char *end = nullptr;
+    const long parsed = strtol(token, &end, 10);
+    if (!end || *end != '\0') {
+        return false;
+    }
+    out = static_cast<int>(parsed);
+    return true;
+}
+
+static bool parseBoolToken(const char *token, bool &out) {
+    if (!token) {
+        return false;
+    }
+    if (strcmp(token, "1") == 0 || strcmp(token, "on") == 0 || strcmp(token, "true") == 0 || strcmp(token, "yes") == 0) {
+        out = true;
+        return true;
+    }
+    if (strcmp(token, "0") == 0 || strcmp(token, "off") == 0 || strcmp(token, "false") == 0 || strcmp(token, "no") == 0) {
+        out = false;
+        return true;
+    }
+    return false;
+}
+
+static void toLowerAscii(char *text) {
+    if (!text) {
+        return;
+    }
+    for (size_t i = 0; text[i]; ++i) {
+        char c = text[i];
+        if (c >= 'A' && c <= 'Z') {
+            text[i] = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+}
+
+static size_t splitTokens(char *line, char **tokens, size_t maxTokens) {
+    if (!line || !tokens || maxTokens == 0) {
+        return 0;
+    }
+    size_t count = 0;
+    char *p = line;
+    while (*p) {
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (!*p) {
+            break;
+        }
+        if (count >= maxTokens) {
+            break;
+        }
+        tokens[count++] = p;
+        while (*p && *p != ' ' && *p != '\t') {
+            ++p;
+        }
+        if (*p) {
+            *p++ = '\0';
+        }
+    }
+    return count;
+}
+
+static TeamPick *findPickBySquadSlot(TeamPick *picks, size_t pickCount, int slot) {
+    if (!picks || slot <= 0) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < pickCount; ++i) {
+        if (picks[i].squadPosition == slot) {
+            return &picks[i];
+        }
+    }
+    if (slot <= static_cast<int>(pickCount)) {
+        return &picks[slot - 1];
+    }
+    return nullptr;
+}
+
+static int canonicalPointsForLive(const TeamPick &pick, const TeamPick::LiveStats &live, bool &okOut) {
+    TeamPick copy = pick;
+    copy.live = live;
+    const int oldTotal = copy.live.totalPoints;
+    const int noBonus = computeExpectedPointsExcludingBonus(copy, okOut);
+    if (!okOut) {
+        return oldTotal;
+    }
+    return noBonus + copy.live.bonus;
+}
+
+static bool applyDemoEventToPick(TeamPick &pick, const char *eventType, int count, int &pointDeltaOut,
+                                 const char *&labelOut) {
+    if (!eventType || count <= 0) {
+        return false;
+    }
+
+    TeamPick::LiveStats next = pick.live;
+    const bool touchesPitchTime =
+        strcmp(eventType, "bonus") != 0 && strcmp(eventType, "b") != 0 && strcmp(eventType, "defcontrib") != 0 &&
+        strcmp(eventType, "dc") != 0 && strcmp(eventType, "minutes") != 0 && strcmp(eventType, "mins") != 0;
+    if (touchesPitchTime && next.minutes < 1) {
+        next.minutes = 1;
+    }
+
+    if (strcmp(eventType, "goal") == 0 || strcmp(eventType, "g") == 0) {
+        next.goalsScored += count;
+        labelOut = "GOAL!";
+    } else if (strcmp(eventType, "assist") == 0 || strcmp(eventType, "a") == 0) {
+        next.assists += count;
+        labelOut = "ASSIST!";
+    } else if (strcmp(eventType, "cs") == 0 || strcmp(eventType, "clean") == 0 || strcmp(eventType, "clean_sheet") == 0) {
+        next.cleanSheets += count;
+        if (next.minutes < 60) {
+            next.minutes = 60;
+        }
+        labelOut = "CLEAN SHEET!";
+    } else if (strcmp(eventType, "concede") == 0 || strcmp(eventType, "gc") == 0) {
+        next.goalsConceded += count;
+        labelOut = "goals against";
+    } else if (strcmp(eventType, "save") == 0 || strcmp(eventType, "saves") == 0 || strcmp(eventType, "sv") == 0) {
+        next.saves += count;
+        labelOut = "SAVE BONUS!";
+    } else if (strcmp(eventType, "bonus") == 0 || strcmp(eventType, "b") == 0) {
+        next.bonus += count;
+        labelOut = "BONUS PTS!";
+    } else if (strcmp(eventType, "yc") == 0 || strcmp(eventType, "yellow") == 0) {
+        next.yellowCards += count;
+        labelOut = "YELLOW!";
+    } else if (strcmp(eventType, "rc") == 0 || strcmp(eventType, "red") == 0) {
+        next.redCards += count;
+        labelOut = "RED!";
+    } else if (strcmp(eventType, "og") == 0 || strcmp(eventType, "own_goal") == 0) {
+        next.ownGoals += count;
+        labelOut = "OWN GOAL!";
+    } else if (strcmp(eventType, "pen_save") == 0 || strcmp(eventType, "psave") == 0) {
+        next.penaltiesSaved += count;
+        labelOut = "PEN SAVE!";
+    } else if (strcmp(eventType, "pen_miss") == 0 || strcmp(eventType, "pmiss") == 0) {
+        next.penaltiesMissed += count;
+        labelOut = "PEN MISS!";
+    } else if (strcmp(eventType, "defcontrib") == 0 || strcmp(eventType, "dc") == 0) {
+        next.defensiveContributions += count;
+        labelOut = "DEF CON!";
+    } else if (strcmp(eventType, "minutes") == 0 || strcmp(eventType, "mins") == 0) {
+        next.minutes += count;
+        if (next.minutes < 0) {
+            next.minutes = 0;
+        }
+        labelOut = "60+ mins!";
+    } else {
+        return false;
+    }
+
+    const int oldTotal = pick.live.totalPoints;
+    next.totalPoints = oldTotal;
+    bool prevOk = false;
+    bool currOk = false;
+    const int prevCanonical = canonicalPointsForLive(pick, pick.live, prevOk);
+    const int currCanonical = canonicalPointsForLive(pick, next, currOk);
+    pointDeltaOut = (prevOk && currOk) ? (currCanonical - prevCanonical) : 0;
+
+    pick.live = next;
+    pick.live.totalPoints = oldTotal + pointDeltaOut;
+    return true;
+}
+
+static void printDemoStateSummary(const DemoState &state) {
+    Serial.println("\n=== Demo Mode ===");
+    Serial.printf("enabled: %s | seeded: %s\n", state.enabled ? "yes" : "no", state.seeded ? "yes" : "no");
+    if (!state.seeded) {
+        Serial.println("Run: demo seed");
+        Serial.println("=================\n");
+        return;
+    }
+    Serial.printf("GW%d points: %d | total: %d\n", state.currentGw, state.gwPoints, state.totalPoints);
+    Serial.printf("GW live: %s | next: %d\n", state.isLiveGw ? "yes" : "no", state.nextGw);
+    if (state.hasDeadline) {
+        Serial.printf("deadline utc epoch: %lld\n", static_cast<long long>(state.deadlineUtc));
+    } else {
+        Serial.println("deadline: not set");
+    }
+    if (state.hasRankData) {
+        Serial.printf("rank: %d (diff %+d)\n", state.overallRank, state.rankDiff);
+    } else {
+        Serial.println("rank: unavailable");
+    }
+    Serial.println("=================\n");
+}
+
+static void printDemoSquad(const DemoState &state) {
+    if (!state.seeded) {
+        Serial.println("[DEMO] Not seeded. Run: demo seed");
+        return;
+    }
+    Serial.println("\n=== Demo Squad Slots ===");
+    for (size_t i = 0; i < state.pickCount; ++i) {
+        const TeamPick &p = state.picks[i];
+        Serial.printf("slot:%2d | element:%4d | %-15s | %s | pts:%d | mult:%d%s%s\n",
+                      p.squadPosition, p.elementId,
+                      p.playerName.length() ? p.playerName.c_str() : "unknown",
+                      p.teamShortName[0] ? p.teamShortName : "-",
+                      p.live.totalPoints, p.multiplier, p.isCaptain ? " C" : "", p.isViceCaptain ? " VC" : "");
+    }
+    Serial.println("========================\n");
+}
+
+static void printDemoHelp() {
+    Serial.println("\nDemo commands:");
+    Serial.println("  demo help");
+    Serial.println("  demo seed");
+    Serial.println("  demo on | demo off");
+    Serial.println("  demo status | demo reset | demo squad");
+    Serial.println("  gw live <0|1>");
+    Serial.println("  gw current <num>");
+    Serial.println("  gw next <num>");
+    Serial.println("  gw deadline in <seconds>");
+    Serial.println("  gw deadline clear");
+    Serial.println("  event <slot> <type> [count]");
+    Serial.println("Event types:");
+    Serial.println("  goal assist cs concede save bonus yc rc og pen_save pen_miss defcontrib mins");
+    Serial.println();
+}
+
+static void handleSerialCommandLine(char *line) {
+    if (!line) {
+        return;
+    }
+
+    char *tokens[8] = {nullptr};
+    const size_t tokenCount = splitTokens(line, tokens, sizeof(tokens) / sizeof(tokens[0]));
+    if (tokenCount == 0) {
+        return;
+    }
+    for (size_t i = 0; i < tokenCount; ++i) {
+        toLowerAscii(tokens[i]);
+    }
+
+    if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
+        printDemoHelp();
+        return;
+    }
+
+    if (strcmp(tokens[0], "demo") == 0) {
+        if (tokenCount < 2 || strcmp(tokens[1], "help") == 0) {
+            printDemoHelp();
+            return;
+        }
+
+        if (strcmp(tokens[1], "seed") == 0) {
+            if (WiFi.status() != WL_CONNECTED && !connectWiFi()) {
+                Serial.println("[DEMO] Seed failed: WiFi not connected");
+                return;
+            }
+            ensureUkTimeConfigured();
+
+            TeamSnapshot snapshot;
+            if (!fetchTeamSnapshot(snapshot)) {
+                Serial.println("[DEMO] Seed failed: could not fetch team snapshot");
+                return;
+            }
+
+            bool isLive = false;
+            int nextGw = 0;
+            bool hasDeadline = false;
+            time_t deadlineUtc = 0;
+            fetchGameweekState(isLive, nextGw, hasDeadline, deadlineUtc);
+
+            int rank = snapshot.overallRank;
+            int rankDiff = 0;
+            const bool hasRankData = fetchRankDelta(rank, rankDiff);
+
+            DemoState updated;
+            if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+                Serial.println("[DEMO] Seed failed: demo state mutex timeout");
+                return;
+            }
+            demoState.seeded = true;
+            demoState.pickCount = snapshot.pickCount;
+            for (size_t i = 0; i < snapshot.pickCount; ++i) {
+                demoState.picks[i] = snapshot.picks[i];
+                demoState.seededPicks[i] = snapshot.picks[i];
+            }
+            demoState.currentGw = snapshot.currentGw;
+            demoState.gwPoints = snapshot.gwPoints;
+            demoState.seededGwPoints = snapshot.gwPoints;
+            demoState.totalPoints = snapshot.overallPoints;
+            demoState.seededTotalPoints = snapshot.overallPoints;
+            demoState.overallRank = rank;
+            demoState.rankDiff = rankDiff;
+            demoState.hasRankData = hasRankData;
+            demoState.isLiveGw = isLive;
+            demoState.nextGw = nextGw;
+            demoState.hasNextGw = nextGw > 0;
+            demoState.hasDeadline = hasDeadline;
+            demoState.deadlineUtc = deadlineUtc;
+            updated = demoState;
+            xSemaphoreGive(demoMutex);
+
+            clearUiEvents();
+            publishDemoStateToUi(updated);
+            setSharedStatus(updated.enabled ? "Demo mode active" : "Demo seeded (ready)", 0x00E5FF);
+            printDemoStateSummary(updated);
+            printDemoSquad(updated);
+            return;
+        }
+
+        if (strcmp(tokens[1], "on") == 0) {
+            DemoState updated;
+            if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+                Serial.println("[DEMO] Failed: demo state mutex timeout");
+                return;
+            }
+            if (!demoState.seeded) {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] Run `demo seed` first");
+                return;
+            }
+            demoState.enabled = true;
+            updated = demoState;
+            xSemaphoreGive(demoMutex);
+            publishDemoStateToUi(updated);
+            setSharedStatus("Demo mode active", 0x00E5FF);
+            printDemoStateSummary(updated);
+            return;
+        }
+
+        if (strcmp(tokens[1], "off") == 0) {
+            if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+                Serial.println("[DEMO] Failed: demo state mutex timeout");
+                return;
+            }
+            demoState.enabled = false;
+            xSemaphoreGive(demoMutex);
+            setSharedStatus("Demo mode off (live polling)", 0xFFCC66);
+            Serial.println("[DEMO] disabled, live polling resumed");
+            return;
+        }
+
+        if (strcmp(tokens[1], "status") == 0) {
+            DemoState local;
+            if (!copyDemoState(local)) {
+                Serial.println("[DEMO] Failed: unable to read demo state");
+                return;
+            }
+            printDemoStateSummary(local);
+            return;
+        }
+
+        if (strcmp(tokens[1], "squad") == 0) {
+            DemoState local;
+            if (!copyDemoState(local)) {
+                Serial.println("[DEMO] Failed: unable to read demo state");
+                return;
+            }
+            printDemoSquad(local);
+            return;
+        }
+
+        if (strcmp(tokens[1], "reset") == 0) {
+            DemoState updated;
+            if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+                Serial.println("[DEMO] Failed: demo state mutex timeout");
+                return;
+            }
+            if (!demoState.seeded) {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] Run `demo seed` first");
+                return;
+            }
+            for (size_t i = 0; i < demoState.pickCount; ++i) {
+                demoState.picks[i] = demoState.seededPicks[i];
+            }
+            demoState.gwPoints = demoState.seededGwPoints;
+            demoState.totalPoints = demoState.seededTotalPoints;
+            updated = demoState;
+            xSemaphoreGive(demoMutex);
+
+            clearUiEvents();
+            publishDemoStateToUi(updated);
+            setSharedStatus(updated.enabled ? "Demo mode active" : "Demo reset", 0x00E5FF);
+            printDemoStateSummary(updated);
+            return;
+        }
+
+        Serial.println("[DEMO] Unknown demo command. Try `demo help`");
+        return;
+    }
+
+    if (strcmp(tokens[0], "gw") == 0) {
+        if (tokenCount < 3) {
+            Serial.println("[DEMO] Usage: gw live|current|next|deadline ...");
+            return;
+        }
+
+        DemoState updated;
+        if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            Serial.println("[DEMO] Failed: demo state mutex timeout");
+            return;
+        }
+        if (!demoState.seeded || !demoState.enabled) {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] Requires active demo mode (run `demo seed`, `demo on`)");
+            return;
+        }
+
+        bool changed = false;
+        if (strcmp(tokens[1], "live") == 0) {
+            bool isLive = false;
+            if (!parseBoolToken(tokens[2], isLive)) {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] gw live expects 0|1");
+                return;
+            }
+            demoState.isLiveGw = isLive;
+            changed = true;
+        } else if (strcmp(tokens[1], "current") == 0) {
+            int gw = 0;
+            if (!parseIntToken(tokens[2], gw) || gw <= 0) {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] gw current expects positive integer");
+                return;
+            }
+            demoState.currentGw = gw;
+            changed = true;
+        } else if (strcmp(tokens[1], "next") == 0) {
+            int gw = 0;
+            if (!parseIntToken(tokens[2], gw) || gw <= 0) {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] gw next expects positive integer");
+                return;
+            }
+            demoState.nextGw = gw;
+            demoState.hasNextGw = true;
+            changed = true;
+        } else if (strcmp(tokens[1], "deadline") == 0) {
+            if (strcmp(tokens[2], "clear") == 0) {
+                demoState.hasDeadline = false;
+                demoState.deadlineUtc = 0;
+                changed = true;
+            } else if (strcmp(tokens[2], "in") == 0 && tokenCount >= 4) {
+                int sec = 0;
+                if (!parseIntToken(tokens[3], sec) || sec < 0) {
+                    xSemaphoreGive(demoMutex);
+                    Serial.println("[DEMO] gw deadline in expects non-negative seconds");
+                    return;
+                }
+                ensureUkTimeConfigured();
+                const time_t now = time(nullptr);
+                if (now <= 100000) {
+                    xSemaphoreGive(demoMutex);
+                    Serial.println("[DEMO] Time unavailable, cannot set deadline");
+                    return;
+                }
+                demoState.deadlineUtc = now + sec;
+                demoState.hasDeadline = true;
+                changed = true;
+            } else {
+                xSemaphoreGive(demoMutex);
+                Serial.println("[DEMO] Usage: gw deadline in <seconds> | gw deadline clear");
+                return;
+            }
+        } else {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] Unknown gw command");
+            return;
+        }
+
+        if (!changed) {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] No changes applied");
+            return;
+        }
+        updated = demoState;
+        xSemaphoreGive(demoMutex);
+
+        publishDemoStateToUi(updated);
+        setSharedStatus("Demo GW context updated", 0x00E5FF);
+        printDemoStateSummary(updated);
+        return;
+    }
+
+    if (strcmp(tokens[0], "event") == 0) {
+        if (tokenCount < 3) {
+            Serial.println("[DEMO] Usage: event <slot> <type> [count]");
+            return;
+        }
+
+        int slot = 0;
+        if (!parseIntToken(tokens[1], slot) || slot <= 0) {
+            Serial.println("[DEMO] Slot must be a positive integer");
+            return;
+        }
+        int count = 1;
+        if (tokenCount >= 4 && (!parseIntToken(tokens[3], count) || count <= 0)) {
+            Serial.println("[DEMO] Count must be a positive integer");
+            return;
+        }
+
+        DemoState updated;
+        TeamPick changedPick;
+        int pointDelta = 0;
+        const char *eventLabel = nullptr;
+        if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            Serial.println("[DEMO] Failed: demo state mutex timeout");
+            return;
+        }
+        if (!demoState.seeded || !demoState.enabled) {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] Requires active demo mode (run `demo seed`, `demo on`)");
+            return;
+        }
+
+        TeamPick *pick = findPickBySquadSlot(demoState.picks, demoState.pickCount, slot);
+        if (!pick) {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] Unknown slot. Use `demo squad` to list slots");
+            return;
+        }
+
+        if (!applyDemoEventToPick(*pick, tokens[2], count, pointDelta, eventLabel)) {
+            xSemaphoreGive(demoMutex);
+            Serial.println("[DEMO] Unknown event type. Use `demo help`");
+            return;
+        }
+        changedPick = *pick;
+        demoState.gwPoints = computeGwPointsFromPicks(demoState.picks, demoState.pickCount);
+        demoState.totalPoints = demoState.seededTotalPoints + (demoState.gwPoints - demoState.seededGwPoints);
+        updated = demoState;
+        xSemaphoreGive(demoMutex);
+
+        if (pointDelta != 0) {
+            notifyEvent(changedPick, pointDelta, eventLabel ? eventLabel : "event");
+        } else {
+            Serial.printf("[DEMO EVENT] %s | no immediate point change\n",
+                          changedPick.playerName.length() ? changedPick.playerName.c_str() : "unknown");
+        }
+        publishDemoStateToUi(updated);
+        setSharedStatus("Demo event applied", 0x00E5FF);
+        Serial.printf("[DEMO EVENT] slot:%d %s x%d => %+d pts | GW%d total: %d\n", slot,
+                      eventLabel ? eventLabel : tokens[2], count, pointDelta, updated.currentGw, updated.gwPoints);
+        return;
+    }
+
+    Serial.println("[DEMO] Unknown command. Try `demo help`");
+}
+
+static void processSerialInput() {
+    while (Serial.available() > 0) {
+        const int raw = Serial.read();
+        if (raw < 0) {
+            return;
+        }
+        const char c = static_cast<char>(raw);
+        if (c == '\r') {
+            continue;
+        }
+        if (c == '\n') {
+            if (serialLineLen > 0) {
+                serialLineBuffer[serialLineLen] = '\0';
+                handleSerialCommandLine(serialLineBuffer);
+                serialLineLen = 0;
+            }
+            continue;
+        }
+        if (c == '\b' || c == 127) {
+            if (serialLineLen > 0) {
+                serialLineLen--;
+            }
+            continue;
+        }
+        if (serialLineLen + 1 >= kSerialLineMax) {
+            serialLineLen = 0;
+            Serial.println("[DEMO] Command too long");
+            continue;
+        }
+        serialLineBuffer[serialLineLen++] = c;
+    }
 }
 
 static UiMode determineAutoMode(const SharedUiState &state) {
@@ -2614,7 +3386,7 @@ static void updateModeUi(const SharedUiState &state, const UiRuntimeState &runti
 
 static void showPopupEvent(const UiEventItem &event) {
     if (ui.popupTitle) {
-        lv_label_set_text(ui.popupTitle, event.delta >= 0 ? "EVENT" : "NEGATIVE");
+        lv_label_set_text(ui.popupTitle, event.label[0] ? event.label : "event");
         lv_obj_set_style_text_color(ui.popupTitle, lv_color_hex(event.delta >= 0 ? kColorAccentGreen : kColorAccentRed), LV_PART_MAIN);
     }
     if (ui.popupPlayer) {
@@ -2680,10 +3452,22 @@ static void fplTask(void *) {
     lastPollMs = 0;
     lastWifiRetryMs = 0;
     uint32_t lastSuccessMs = 0;
+    bool demoModeAnnounced = false;
     setSharedStatus("Connecting WiFi...", 0xFFCC66);
 
     for (;;) {
         const uint32_t now = millis();
+
+        if (isDemoModeEnabled()) {
+            if (!demoModeAnnounced) {
+                setSharedStatus("Demo mode active", 0x00E5FF);
+                setSharedFreshness(false, now);
+                demoModeAnnounced = true;
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+        demoModeAnnounced = false;
 
         if (WiFi.status() != WL_CONNECTED) {
             if (lastWifiRetryMs == 0 || now - lastWifiRetryMs >= 10000) {
@@ -2806,6 +3590,7 @@ void setup() {
     Serial.println("UI ready");
     sharedUiMutex = xSemaphoreCreateMutex();
     uiRuntimeMutex = xSemaphoreCreateMutex();
+    demoMutex = xSemaphoreCreateMutex();
     if (!sharedUiMutex) {
         Serial.println("Failed to create UI state mutex");
         while (true) {
@@ -2814,6 +3599,12 @@ void setup() {
     }
     if (!uiRuntimeMutex) {
         Serial.println("Failed to create UI runtime mutex");
+        while (true) {
+            delay(1000);
+        }
+    }
+    if (!demoMutex) {
+        Serial.println("Failed to create demo state mutex");
         while (true) {
             delay(1000);
         }
@@ -2843,8 +3634,10 @@ void setup() {
         }
     }
     Serial.println("Worker tasks started");
+    Serial.println("Type `demo help` in serial monitor for manual demo controls");
 }
 
 void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    processSerialInput();
+    vTaskDelay(pdMS_TO_TICKS(20));
 }
