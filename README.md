@@ -2,6 +2,17 @@
 
 FPL Buddy now targets the **Waveshare ESP32-S3-Touch-LCD-1.46** platform.
 
+## Version Status
+
+This is **v1** of the project.
+
+- The current code works, but it still needs optimization (for example, avoiding frequent fetches of the large `bootstrap-static` endpoint).
+- Planned feature ideas for screens that cycle between game weeks:
+  - mini-league rank
+  - price changes
+  - predicted price changes
+- CAD files and full assembly instructions will be published shortly.
+
 ## Hardware Migration Note
 
 The project was migrated from Sunton ESP32-2424S012C (ESP32-C3) to **Waveshare ESP32-S3-Touch-LCD-1.46**.
@@ -34,7 +45,21 @@ Edit `include/wifi_config.h`:
 - `WIFI_SSID`
 - `WIFI_PASSWORD`
 
-## Build / Flash
+## Installation
+
+1. Install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/index.html) (or use PlatformIO in VS Code).
+2. Clone this repository:
+
+```bash
+git clone https://github.com/ivannson/fpl-buddy.git
+cd fpl-buddy
+```
+
+3. Update project configuration:
+- `include/wifi_config.h` with your Wi-Fi credentials
+- `include/fpl_config.h` with your FPL team/entry ID
+
+4. Build and flash:
 
 ```bash
 pio run
