@@ -1,5 +1,8 @@
 # FPL Buddy — Waveshare ESP32-S3-Touch-LCD-1.46
 
+Full build video coming soon on my YouTube channel: [Nvkvmakes](https://www.youtube.com/@Nvkvmakes).
+Short-form project videos and work in progress will be posted on Instagram: [@nvkv.makes](https://www.instagram.com/nvkv.makes/).
+
 FPL Buddy now targets the **Waveshare ESP32-S3-Touch-LCD-1.46** platform.
 
 ## Version Status
