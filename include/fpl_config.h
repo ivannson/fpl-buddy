@@ -38,3 +38,44 @@
 #ifndef FPL_USE_SERVER_EVENT_BREAKDOWN
 #define FPL_USE_SERVER_EVENT_BREAKDOWN 1
 #endif
+
+// 16-LED WS2812/NeoPixel status ring.
+#ifndef FPL_LED_RING_ENABLED
+#define FPL_LED_RING_ENABLED 1
+#endif
+
+#ifndef FPL_LED_RING_PIN
+#define FPL_LED_RING_PIN 1
+#endif
+
+#ifndef FPL_LED_RING_LED_COUNT
+#define FPL_LED_RING_LED_COUNT 16
+#endif
+
+#ifndef FPL_LED_RING_MAX_BRIGHTNESS
+#define FPL_LED_RING_MAX_BRIGHTNESS 64
+#endif
+
+#ifndef FPL_LED_RING_SPIN_INTERVAL_MS
+#define FPL_LED_RING_SPIN_INTERVAL_MS 90U
+#endif
+
+#ifndef FPL_LED_RING_PULSE_PERIOD_MS
+#define FPL_LED_RING_PULSE_PERIOD_MS 1400U
+#endif
+
+#ifndef FPL_LED_RING_NOTIFICATION_FLASH_COUNT
+#define FPL_LED_RING_NOTIFICATION_FLASH_COUNT 2U
+#endif
+
+#ifndef FPL_LED_RING_NOTIFICATION_FLASH_MS
+#define FPL_LED_RING_NOTIFICATION_FLASH_MS 160U
+#endif
+
+// Animation modes:
+// 0 = breathing (all LEDs pulse together)
+// 1 = dim-notch (all lit, one dim LED rotates)
+// 2 = comet (bright head + fading tail rotates)
+#ifndef FPL_LED_RING_DEFAULT_ANIMATION
+#define FPL_LED_RING_DEFAULT_ANIMATION 2
+#endif

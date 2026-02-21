@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "fpl_config.h"
+#include "led_ring.h"
 #include "wifi_config.h"
 
 LV_FONT_DECLARE(lv_font_montserrat_16);
@@ -38,6 +39,7 @@ static uint32_t lastPollMs = 0;
 static uint32_t lastWifiRetryMs = 0;
 static TaskHandle_t uiTaskHandle = nullptr;
 static TaskHandle_t fplTaskHandle = nullptr;
+static TaskHandle_t ledTaskHandle = nullptr;
 
 static constexpr int kKitWidth = 110;
 static constexpr int kKitHeight = 145;
@@ -266,6 +268,22 @@ struct DemoState {
 static LastPickState lastPickStates[16];
 static DemoState demoState;
 static SemaphoreHandle_t demoMutex = nullptr;
+enum class ScriptedDemoKind {
+    None = 0,
+    Notification = 1
+};
+struct ScriptedDemoState {
+    bool active = false;
+    ScriptedDemoKind kind = ScriptedDemoKind::None;
+    uint8_t stage = 0;
+    uint32_t triggerAtMs = 0;
+    int baseRank = 0;
+};
+static ScriptedDemoState scriptedDemoState;
+static SemaphoreHandle_t scriptedDemoMutex = nullptr;
+static constexpr uint32_t kDemoNotificationDelayMs = 30000U;
+static constexpr int32_t kDemoDeadline45mSec = 45 * 60;
+static constexpr int32_t kDemoDeadline7mSec = 7 * 60;
 static constexpr size_t kSerialLineMax = 192;
 static char serialLineBuffer[kSerialLineMax];
 static size_t serialLineLen = 0;
@@ -290,6 +308,13 @@ static TeamPick *findPickBySquadSlot(TeamPick *picks, size_t pickCount, int slot
 static int canonicalPointsForLive(const TeamPick &pick, const TeamPick::LiveStats &live, bool &okOut);
 static bool applyDemoEventToPick(TeamPick &pick, const char *eventType, int count, int &pointDeltaOut,
                                  const char *&labelOut);
+static bool ensureUkTimeConfigured();
+static void serviceScriptedDemo();
+static void startNotificationScriptedDemo();
+static void startDeadlineScriptedDemo(int32_t secondsToDeadline);
+static void squadDemoNotificationBtnCb(lv_event_t *e);
+static void squadDemoDeadline45BtnCb(lv_event_t *e);
+static void squadDemoDeadline7BtnCb(lv_event_t *e);
 static void handleSerialCommandLine(char *line);
 static void processSerialInput();
 
@@ -1765,6 +1790,7 @@ static const lv_font_t *kFontCaption = &lv_font_montserrat_18;
 static const lv_font_t *kFontMicro = &lv_font_montserrat_14;
 
 static uint32_t popupHideAtMs = 0;
+static constexpr uint32_t kPopupDisplayDurationMs = 4000U;
 static uint32_t lastTickerRotateMs = 0;
 static uint32_t lastDeadlineBlinkMs = 0;
 static bool deadlineColonVisible = true;
@@ -2023,6 +2049,46 @@ static void refreshSquadList(const UiRuntimeState &runtime) {
         lv_label_set_text(points, ptsBuf);
         lv_obj_align(points, LV_ALIGN_RIGHT_MID, -8, 0);
     }
+
+    lv_obj_t *footer = lv_obj_create(ui.squadList);
+    lv_obj_set_size(footer, lv_pct(100), 42);
+    lv_obj_set_style_bg_opa(footer, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(footer, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(footer, 0, LV_PART_MAIN);
+
+    static constexpr int kFooterBtnW = 100;
+    static constexpr int kFooterBtnH = 32;
+    static constexpr int kFooterGap = 6;
+
+    lv_obj_t *demoBtn1 = lv_button_create(footer);
+    lv_obj_set_size(demoBtn1, kFooterBtnW, kFooterBtnH);
+    lv_obj_align(demoBtn1, LV_ALIGN_LEFT_MID, 6, 0);
+    stylePurpleButton(demoBtn1);
+    lv_obj_set_style_border_width(demoBtn1, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(demoBtn1, squadDemoNotificationBtnCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *demoBtn1Label = createLabel(demoBtn1, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(demoBtn1Label, "Notify");
+    lv_obj_center(demoBtn1Label);
+
+    lv_obj_t *demoBtn2 = lv_button_create(footer);
+    lv_obj_set_size(demoBtn2, kFooterBtnW, kFooterBtnH);
+    lv_obj_align_to(demoBtn2, demoBtn1, LV_ALIGN_OUT_RIGHT_MID, kFooterGap, 0);
+    stylePurpleButton(demoBtn2);
+    lv_obj_set_style_border_width(demoBtn2, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(demoBtn2, squadDemoDeadline45BtnCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *demoBtn2Label = createLabel(demoBtn2, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(demoBtn2Label, "45m");
+    lv_obj_center(demoBtn2Label);
+
+    lv_obj_t *demoBtn3 = lv_button_create(footer);
+    lv_obj_set_size(demoBtn3, kFooterBtnW, kFooterBtnH);
+    lv_obj_align_to(demoBtn3, demoBtn2, LV_ALIGN_OUT_RIGHT_MID, kFooterGap, 0);
+    stylePurpleButton(demoBtn3);
+    lv_obj_set_style_border_width(demoBtn3, 0, LV_PART_MAIN);
+    lv_obj_add_event_cb(demoBtn3, squadDemoDeadline7BtnCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t *demoBtn3Label = createLabel(demoBtn3, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(demoBtn3Label, "7m");
+    lv_obj_center(demoBtn3Label);
 }
 
 static void backFromEventsCb(lv_event_t *) {
@@ -2194,16 +2260,6 @@ static void createUi(void) {
     ui.deadlineMeta = createLabel(ui.screenDeadline, &lv_font_montserrat_22, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(ui.deadlineMeta, LV_ALIGN_CENTER, 0, 84);
 
-    ui.finalArc = lv_arc_create(ui.screenFinalHour);
-    lv_obj_set_size(ui.finalArc, 340, 340);
-    lv_obj_center(ui.finalArc);
-    lv_arc_set_range(ui.finalArc, 0, 3600);
-    lv_obj_set_style_arc_width(ui.finalArc, 30, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(ui.finalArc, 30, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(0x242424), LV_PART_MAIN);
-    lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(kColorAccentAmber), LV_PART_INDICATOR);
-    lv_obj_remove_style(ui.finalArc, nullptr, LV_PART_KNOB);
-    lv_obj_remove_flag(ui.finalArc, LV_OBJ_FLAG_CLICKABLE);
     ui.finalCountdown = createLabel(ui.screenFinalHour, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
     lv_obj_center(ui.finalCountdown);
 
@@ -2321,6 +2377,8 @@ static void setSharedGwStateText(const char *text) {
 
 static void setSharedGameweekContext(bool isLiveGw, int currentGw, int nextGw, bool hasNextGw, time_t deadlineUtc,
                                      bool hasDeadline) {
+    ledRingSetDeadlineCountdown(hasDeadline && !isLiveGw, deadlineUtc);
+
     if (!sharedUiMutex) {
         return;
     }
@@ -2339,6 +2397,8 @@ static void setSharedGameweekContext(bool isLiveGw, int currentGw, int nextGw, b
 }
 
 static void setSharedRankData(int overallRank, int rankDiff, bool hasRankData) {
+    ledRingSetRankTrend(rankDiff, hasRankData);
+
     if (!sharedUiMutex) {
         return;
     }
@@ -2392,6 +2452,166 @@ static bool readSharedUiState(SharedUiState &out) {
     out = sharedUiState;
     xSemaphoreGive(sharedUiMutex);
     return true;
+}
+
+static bool isScriptedDemoActive() {
+    if (!scriptedDemoMutex) {
+        return false;
+    }
+    if (xSemaphoreTake(scriptedDemoMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return false;
+    }
+    const bool active = scriptedDemoState.active;
+    xSemaphoreGive(scriptedDemoMutex);
+    return active;
+}
+
+static void fillScriptedEventFromSlot(int slot, const char *label, int delta, const char *icon, int totalBefore,
+                                      UiEventItem &eventOut) {
+    memset(&eventOut, 0, sizeof(eventOut));
+    strlcpy(eventOut.icon, icon, sizeof(eventOut.icon));
+    sanitizeUtf8ToAscii(label, eventOut.label, sizeof(eventOut.label));
+    snprintf(eventOut.player, sizeof(eventOut.player), "Player %d", slot);
+    eventOut.delta = delta;
+    eventOut.totalBefore = totalBefore;
+    eventOut.totalAfter = totalBefore + delta;
+    eventOut.epochMs = millis();
+
+    if (!uiRuntimeMutex) {
+        return;
+    }
+    if (xSemaphoreTake(uiRuntimeMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return;
+    }
+    const size_t idx = (slot > 0) ? static_cast<size_t>(slot - 1) : 0;
+    if (idx < uiRuntimeState.squadCount) {
+        const UiSquadRow &row = uiRuntimeState.squadRows[idx];
+        sanitizeUtf8ToAscii(row.player, eventOut.player, sizeof(eventOut.player));
+        strlcpy(eventOut.team, row.team, sizeof(eventOut.team));
+        eventOut.isGk = row.isGk;
+    }
+    xSemaphoreGive(uiRuntimeMutex);
+}
+
+static void startNotificationScriptedDemo() {
+    SharedUiState local;
+    if (!readSharedUiState(local)) {
+        memset(&local, 0, sizeof(local));
+    }
+
+    const int baseRank = (local.hasRankData && local.overallRank > 0) ? local.overallRank : 100000;
+    const int currentGw = local.currentGw > 0 ? local.currentGw : 1;
+    const int nextGw = local.hasNextGw ? local.nextGw : (currentGw + 1);
+    const bool hasNextGw = local.hasNextGw || nextGw > 0;
+
+    if (scriptedDemoMutex && xSemaphoreTake(scriptedDemoMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        scriptedDemoState.active = true;
+        scriptedDemoState.kind = ScriptedDemoKind::Notification;
+        scriptedDemoState.stage = 0;
+        scriptedDemoState.baseRank = baseRank;
+        scriptedDemoState.triggerAtMs = millis() + kDemoNotificationDelayMs;
+        xSemaphoreGive(scriptedDemoMutex);
+    }
+
+    setSharedGameweekContext(true, currentGw, nextGw, hasNextGw, local.nextDeadlineUtc, local.hasNextDeadline);
+    setSharedRankData(baseRank, -500, true);
+    setSharedStatus("Demo: rank dropping", 0xFF5A5A);
+    loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_FADE_ON);
+}
+
+static void startDeadlineScriptedDemo(int32_t secondsToDeadline) {
+    if (scriptedDemoMutex && xSemaphoreTake(scriptedDemoMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        scriptedDemoState = ScriptedDemoState{};
+        xSemaphoreGive(scriptedDemoMutex);
+    }
+
+    ensureUkTimeConfigured();
+    const time_t nowUtc = time(nullptr);
+    if (nowUtc <= 100000) {
+        setSharedStatus("Demo: time unavailable", 0xFF5A5A);
+        return;
+    }
+
+    SharedUiState local;
+    if (!readSharedUiState(local)) {
+        memset(&local, 0, sizeof(local));
+    }
+
+    const int currentGw = local.currentGw > 0 ? local.currentGw : 1;
+    const int nextGw = local.hasNextGw ? local.nextGw : (currentGw + 1);
+    const bool hasNextGw = local.hasNextGw || nextGw > 0;
+    const time_t deadlineUtc = nowUtc + secondsToDeadline;
+    setSharedGameweekContext(false, currentGw, nextGw, hasNextGw, deadlineUtc, true);
+    setSharedStatus("Demo: custom deadline", 0x00E5FF);
+    loadMode(UiMode::FinalHour, LV_SCR_LOAD_ANIM_FADE_ON);
+}
+
+static void squadDemoNotificationBtnCb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    startNotificationScriptedDemo();
+}
+
+static void squadDemoDeadline45BtnCb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    startDeadlineScriptedDemo(kDemoDeadline45mSec);
+}
+
+static void squadDemoDeadline7BtnCb(lv_event_t *e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) {
+        return;
+    }
+    startDeadlineScriptedDemo(kDemoDeadline7mSec);
+}
+
+static void serviceScriptedDemo() {
+    if (!scriptedDemoMutex) {
+        return;
+    }
+
+    int baseRank = 0;
+    bool triggerEvents = false;
+    const uint32_t nowMs = millis();
+    if (xSemaphoreTake(scriptedDemoMutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return;
+    }
+    if (scriptedDemoState.active && scriptedDemoState.kind == ScriptedDemoKind::Notification &&
+        scriptedDemoState.stage == 0 && nowMs >= scriptedDemoState.triggerAtMs) {
+        scriptedDemoState.stage = 1;
+        baseRank = scriptedDemoState.baseRank;
+        scriptedDemoState.active = false;
+        scriptedDemoState.kind = ScriptedDemoKind::None;
+        triggerEvents = true;
+    }
+    xSemaphoreGive(scriptedDemoMutex);
+
+    if (!triggerEvents) {
+        return;
+    }
+
+    UiEventItem goalEvent;
+    fillScriptedEventFromSlot(2, "GOAL!", 5, "G", 1, goalEvent);
+    pushUiEvent(goalEvent);
+
+    UiEventItem assistEvent;
+    fillScriptedEventFromSlot(5, "ASSIST!", 3, "A", 1, assistEvent);
+    pushUiEvent(assistEvent);
+
+    SharedUiState local;
+    if (readSharedUiState(local)) {
+        setSharedGwPoints(local.gwPoints + goalEvent.delta + assistEvent.delta);
+        if (local.hasTotalPoints) {
+            setSharedTotalPoints(local.totalPoints + goalEvent.delta + assistEvent.delta, true);
+        }
+    }
+
+    const int improvedRank = (baseRank > 10000) ? (baseRank - 10000) : 1;
+    setSharedRankData(improvedRank, 10000, true);
+    setSharedStatus("Demo: rank recovered", 0x38D39F);
+    loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_FADE_ON);
 }
 
 static void snapshotUiRuntime(UiRuntimeState &out) {
@@ -2862,6 +3082,7 @@ static void printDemoSquad(const DemoState &state) {
 static void printDemoHelp() {
     Serial.println("\nDemo commands:");
     Serial.println("  demo help");
+    Serial.println("  demo sequence <notification|deadline1|deadline2>");
     Serial.println("  demo seed");
     Serial.println("  demo on | demo off");
     Serial.println("  demo status | demo reset | demo squad");
@@ -2898,6 +3119,35 @@ static void handleSerialCommandLine(char *line) {
     if (strcmp(tokens[0], "demo") == 0) {
         if (tokenCount < 2 || strcmp(tokens[1], "help") == 0) {
             printDemoHelp();
+            return;
+        }
+
+        if (strcmp(tokens[1], "sequence") == 0) {
+            if (tokenCount < 3) {
+                Serial.println("[DEMO] Usage: demo sequence <notification|deadline1|deadline2>");
+                return;
+            }
+
+            if (strcmp(tokens[2], "notification") == 0 || strcmp(tokens[2], "notify") == 0 ||
+                strcmp(tokens[2], "notif") == 0 || strcmp(tokens[2], "n") == 0) {
+                startNotificationScriptedDemo();
+                Serial.println("[DEMO] Sequence started: notification");
+                return;
+            }
+            if (strcmp(tokens[2], "deadline1") == 0 || strcmp(tokens[2], "d1") == 0 ||
+                strcmp(tokens[2], "45m") == 0) {
+                startDeadlineScriptedDemo(kDemoDeadline45mSec);
+                Serial.println("[DEMO] Sequence started: deadline1 (45m)");
+                return;
+            }
+            if (strcmp(tokens[2], "deadline2") == 0 || strcmp(tokens[2], "d2") == 0 ||
+                strcmp(tokens[2], "7m") == 0) {
+                startDeadlineScriptedDemo(kDemoDeadline7mSec);
+                Serial.println("[DEMO] Sequence started: deadline2 (7m)");
+                return;
+            }
+
+            Serial.println("[DEMO] Unknown sequence. Use: notification|deadline1|deadline2");
             return;
         }
 
@@ -3315,7 +3565,7 @@ static void updateModeUi(const SharedUiState &state, const UiRuntimeState &runti
         lv_label_set_text(ui.deadlineMeta, buf);
     }
 
-    if (ui.finalArc && ui.finalCountdown && state.hasNextDeadline) {
+    if (ui.finalCountdown && state.hasNextDeadline) {
         const time_t now = time(nullptr);
         int64_t sec = now > 100000 ? (static_cast<int64_t>(state.nextDeadlineUtc) - static_cast<int64_t>(now)) : 0;
         if (sec < 0) {
@@ -3323,12 +3573,6 @@ static void updateModeUi(const SharedUiState &state, const UiRuntimeState &runti
         }
         if (sec > 3600) {
             sec = 3600;
-        }
-        lv_arc_set_value(ui.finalArc, static_cast<int>(sec));
-        if (sec < 900) {
-            lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(kColorAccentRed), LV_PART_INDICATOR);
-        } else {
-            lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(kColorAccentAmber), LV_PART_INDICATOR);
         }
         snprintf(buf, sizeof(buf), "%02d:%02d", static_cast<int>(sec / 60), static_cast<int>(sec % 60));
         lv_label_set_text(ui.finalCountdown, buf);
@@ -3412,7 +3656,8 @@ static void showPopupEvent(const UiEventItem &event) {
         }
     }
     loadMode(UiMode::EventPopup, LV_SCR_LOAD_ANIM_FADE_ON);
-    popupHideAtMs = millis() + 4000U;
+    ledRingTriggerNotificationForMs(kPopupDisplayDurationMs);
+    popupHideAtMs = millis() + kPopupDisplayDurationMs;
 }
 
 static void uiTask(void *) {
@@ -3424,6 +3669,7 @@ static void uiTask(void *) {
         if (readSharedUiState(localState)) {
             snapshotUiRuntime(localRuntime);
             updateModeUi(localState, localRuntime);
+            serviceScriptedDemo();
 
             UiMode autoMode = determineAutoMode(localState);
             if (currentMode != UiMode::EventsList && currentMode != UiMode::Squad && currentMode != UiMode::EventPopup) {
@@ -3457,6 +3703,11 @@ static void fplTask(void *) {
 
     for (;;) {
         const uint32_t now = millis();
+
+        if (isScriptedDemoActive()) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
 
         if (isDemoModeEnabled()) {
             if (!demoModeAnnounced) {
@@ -3527,11 +3778,19 @@ static void fplTask(void *) {
     }
 }
 
+static void ledTask(void *) {
+    for (;;) {
+        ledRingTick(millis());
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
 
     Serial.println("\\n=== Waveshare ESP32-S3-Touch-LCD-1.46B: FPL Buddy ===");
+    ledRingInit();
 
     if (!display.begin()) {
         Serial.println("Display init failed");
@@ -3591,6 +3850,7 @@ void setup() {
     sharedUiMutex = xSemaphoreCreateMutex();
     uiRuntimeMutex = xSemaphoreCreateMutex();
     demoMutex = xSemaphoreCreateMutex();
+    scriptedDemoMutex = xSemaphoreCreateMutex();
     if (!sharedUiMutex) {
         Serial.println("Failed to create UI state mutex");
         while (true) {
@@ -3605,6 +3865,12 @@ void setup() {
     }
     if (!demoMutex) {
         Serial.println("Failed to create demo state mutex");
+        while (true) {
+            delay(1000);
+        }
+    }
+    if (!scriptedDemoMutex) {
+        Serial.println("Failed to create scripted demo mutex");
         while (true) {
             delay(1000);
         }
@@ -3626,8 +3892,9 @@ void setup() {
 
     xTaskCreatePinnedToCore(uiTask, "uiTask", 12288, nullptr, 2, &uiTaskHandle, kUiCore);
     xTaskCreatePinnedToCore(fplTask, "fplTask", 12288, nullptr, 1, &fplTaskHandle, kFplCore);
+    xTaskCreatePinnedToCore(ledTask, "ledTask", 4096, nullptr, 2, &ledTaskHandle, kUiCore);
 
-    if (!uiTaskHandle || !fplTaskHandle) {
+    if (!uiTaskHandle || !fplTaskHandle || !ledTaskHandle) {
         Serial.println("Failed to create worker tasks");
         while (true) {
             delay(1000);
