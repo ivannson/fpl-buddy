@@ -40,10 +40,43 @@ Edit `include/fpl_config.h`:
 
 - `FPL_ENTRY_ID` - your FPL entry/team ID
 - `FPL_POLL_INTERVAL_MS` - polling interval in milliseconds
+- Optional tuning values (for example `FPL_ENABLE_NAME_LOOKUP`, LED ring settings, and JSON/PSRAM limits) can be adjusted for your hardware and preferred behavior.
+
+Example:
+
+```cpp
+#pragma once
+
+#define FPL_ENTRY_ID 1234567
+#define FPL_POLL_INTERVAL_MS (60UL * 1000UL)
+
+// Optional behavior flags
+#define FPL_ENABLE_NAME_LOOKUP 1
+#define FPL_USE_SERVER_EVENT_BREAKDOWN 1
+
+// Optional LED ring settings
+#define FPL_LED_RING_ENABLED 1
+#define FPL_LED_RING_PIN 1
+#define FPL_LED_RING_LED_COUNT 16
+#define FPL_LED_RING_MAX_BRIGHTNESS 64
+```
 
 ### Wi-Fi config
 
-Edit `include/wifi_config.h`:
+`include/wifi_config.h` is intentionally ignored by Git (to avoid committing credentials).
+
+Create it locally with:
+
+```cpp
+#pragma once
+
+#define WIFI_SSID     "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+```
+
+Do not commit this file with real credentials.
+
+After creating it, the firmware reads:
 
 - `WIFI_SSID`
 - `WIFI_PASSWORD`
@@ -58,16 +91,43 @@ git clone https://github.com/ivannson/fpl-buddy.git
 cd fpl-buddy
 ```
 
-3. Update project configuration:
-- `include/wifi_config.h` with your Wi-Fi credentials
-- `include/fpl_config.h` with your FPL team/entry ID
+3. Pull required submodules (including custom board definitions):
 
-4. Build and flash:
+```bash
+git submodule update --init --recursive
+```
+
+4. Create/update required local configuration files:
+- Create `include/wifi_config.h` (template above) with your Wi-Fi credentials.
+- Edit `include/fpl_config.h` with your FPL team/entry ID (`FPL_ENTRY_ID`).
+- If your wiring differs, review `platformio.ini` and LED ring settings in `include/fpl_config.h` (pin, LED count, brightness).
+
+5. Build and flash:
 
 ```bash
 pio run
 pio run -t upload
 pio device monitor
+```
+
+6. Upload kit images to filesystem (separate from firmware):
+
+```bash
+pio run -t uploadfs
+```
+
+This uploads the `data/` folder (including `data/kits/*.rgb565`) to LittleFS on the ESP32.
+
+If kits are not uploaded, event notifications still work, but they will display without shirt images.
+
+Example update workflow:
+
+```bash
+# Code only
+pio run -t upload
+
+# Kits/filesystem only
+pio run -t uploadfs
 ```
 
 ## PlatformIO target
