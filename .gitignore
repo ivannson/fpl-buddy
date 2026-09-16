@@ -4,3 +4,9 @@ include/wifi_config.h
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# API test outputs (raw responses, snapshots, logs)
+api_test/outputs/
+api_test/__pycache__/
+api_test/README_26-27_api_review_2026-09-16.md
+changelog.md

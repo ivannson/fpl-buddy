@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <lvgl.h>
+#include <miniz.h>
 #include <time.h>
 #include <cstring>
 
@@ -237,6 +238,13 @@ struct TeamSnapshot {
     int currentGw = 0;
     int overallRank = 0;
     int overallPoints = 0;
+    int rankDiff = 0;
+    bool hasRankData = false;
+    bool hasGwState = false;
+    bool isLiveGw = false;
+    int nextGw = 0;
+    bool hasDeadline = false;
+    time_t deadlineUtc = 0;
     int gwPoints = 0;
     bool hasPlayerMeta = false;
     String activeChip;
@@ -318,203 +326,308 @@ static void squadDemoDeadline7BtnCb(lv_event_t *e);
 static void handleSerialCommandLine(char *line);
 static void processSerialInput();
 
-static void setupHttpDefaults(HTTPClient &http) {
-    http.setConnectTimeout(15000);
-    http.setTimeout(30000);
-    http.useHTTP10(true);
-    http.setUserAgent("fpl-buddy/1.0");
-    http.addHeader("Accept", "application/json");
-    http.addHeader("Accept-Encoding", "identity");
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+// ---------------------------------------------------------------------------
+// HTTP transport
+// All requests in a poll share one kept-alive TLS connection and ask for gzip. Compressed bodies are
+// inflated into PSRAM with the ESP32-S3 ROM miniz (tinfl), so no extra library is needed.
+// ---------------------------------------------------------------------------
+static constexpr const char *kFplApiBase = "https://fantasy.premierleague.com/api/";
+static constexpr size_t kSmallJsonMaxBytes = 256UL * 1024UL;
+
+static WiFiClientSecure fplTlsClient;
+static HTTPClient fplHttp;
+// Guards fplTlsClient, fplHttp and fplCache. Held for a whole poll (fplTask) or `demo seed` (serial task).
+static SemaphoreHandle_t fplDataMutex = nullptr;
+
+struct FplHttpStats {
+    uint32_t requests = 0;
+    uint32_t tlsHandshakes = 0;
+    size_t wireBytes = 0;
+    size_t jsonBytes = 0;
+};
+static FplHttpStats fplHttpStats;
+
+static void configureFplHttp() {
+    fplTlsClient.setInsecure();
+    fplHttp.setConnectTimeout(15000);
+    fplHttp.setTimeout(30000);
+    fplHttp.useHTTP10(false);
+    fplHttp.setReuse(true);
+    fplHttp.setUserAgent("fpl-buddy/1.0");
+    // HTTPClient ignores addHeader("Accept-Encoding", ...); it must be set here.
+    fplHttp.setAcceptEncoding("gzip, identity");
+    fplHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 }
 
-enum class JsonReadMode {
-    Stream,
-    StringBody
+static void closeFplConnection() {
+    fplHttp.end();
+    fplTlsClient.stop();
+}
+
+// Growable, NUL-terminated PSRAM buffer that HTTPClient::writeToStream() can fill (handles chunked bodies).
+class PsramBufferSink : public Stream {
+public:
+    explicit PsramBufferSink(size_t maxBytes) : maxBytes_(maxBytes) {}
+    ~PsramBufferSink() {
+        if (buf_) {
+            heap_caps_free(buf_);
+        }
+    }
+
+    bool reserve(size_t bytes) {
+        return grow(bytes < maxBytes_ ? bytes : maxBytes_);
+    }
+
+    size_t write(uint8_t b) override {
+        return write(&b, 1);
+    }
+
+    size_t write(const uint8_t *data, size_t size) override {
+        if (len_ + size > maxBytes_) {
+            overflowed_ = true;
+            return 0;
+        }
+        if (len_ + size > capacity_) {
+            size_t target = capacity_ * 2;
+            if (target < len_ + size) {
+                target = len_ + size;
+            }
+            if (target > maxBytes_) {
+                target = maxBytes_;
+            }
+            if (!grow(target)) {
+                return 0;
+            }
+        }
+        memcpy(buf_ + len_, data, size);
+        len_ += size;
+        return size;
+    }
+
+    int available() override {
+        return 0;
+    }
+    int read() override {
+        return -1;
+    }
+    int peek() override {
+        return -1;
+    }
+
+    bool overflowed() const {
+        return overflowed_;
+    }
+    size_t length() const {
+        return len_;
+    }
+
+    // Hands ownership of the NUL-terminated buffer to the caller (free with heap_caps_free).
+    char *release() {
+        if (!buf_ && !grow(0)) {
+            return nullptr;
+        }
+        buf_[len_] = '\0';
+        char *out = buf_;
+        buf_ = nullptr;
+        capacity_ = 0;
+        len_ = 0;
+        return out;
+    }
+
+private:
+    bool grow(size_t capacity) {
+        if (buf_ && capacity <= capacity_) {
+            return true;
+        }
+        char *next = static_cast<char *>(heap_caps_realloc(buf_, capacity + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!next) {
+            return false;
+        }
+        buf_ = next;
+        capacity_ = capacity;
+        return true;
+    }
+
+    char *buf_ = nullptr;
+    size_t capacity_ = 0;
+    size_t len_ = 0;
+    size_t maxBytes_;
+    bool overflowed_ = false;
 };
 
-static bool getJsonDocument(const String &url, DynamicJsonDocument &doc, JsonDocument *filter = nullptr,
-                            JsonReadMode mode = JsonReadMode::Stream) {
+static bool isGzip(const char *data, size_t len) {
+    return len >= 18 && static_cast<uint8_t>(data[0]) == 0x1F && static_cast<uint8_t>(data[1]) == 0x8B;
+}
+
+static uint32_t readLe32(const uint8_t *p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// Inflates a single gzip member into a new NUL-terminated PSRAM buffer and checks its CRC32.
+static bool gunzipToPsram(const char *in, size_t inLen, size_t maxBytes, char *&out, size_t &outLen) {
+    out = nullptr;
+    outLen = 0;
+    const uint8_t *src = static_cast<const uint8_t *>(static_cast<const void *>(in));
+    if (!isGzip(in, inLen) || src[2] != 8) {  // 8 = deflate
+        return false;
+    }
+
+    const uint8_t flags = src[3];
+    size_t pos = 10;
+    if (flags & 0x04) {  // FEXTRA
+        if (pos + 2 > inLen) {
+            return false;
+        }
+        pos += 2 + (static_cast<size_t>(src[pos]) | (static_cast<size_t>(src[pos + 1]) << 8));
+    }
+    for (uint8_t zeroTerminatedField : {uint8_t{0x08}, uint8_t{0x10}}) {  // FNAME, FCOMMENT
+        if (flags & zeroTerminatedField) {
+            while (pos < inLen && src[pos]) {
+                ++pos;
+            }
+            ++pos;
+        }
+    }
+    if (flags & 0x02) {  // FHCRC
+        pos += 2;
+    }
+    if (pos + 8 > inLen) {
+        return false;
+    }
+
+    const uint32_t expectedCrc = readLe32(src + inLen - 8);
+    const size_t expectedLen = readLe32(src + inLen - 4);
+    if (expectedLen == 0 || expectedLen > maxBytes) {
+        Serial.printf("gunzip: inflated size %u exceeds limit %u\n", static_cast<unsigned>(expectedLen),
+                      static_cast<unsigned>(maxBytes));
+        return false;
+    }
+
+    char *buf = static_cast<char *>(heap_caps_malloc(expectedLen + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    // ~11 KB of Huffman tables; prefer internal RAM for speed.
+    tinfl_decompressor *inflator = static_cast<tinfl_decompressor *>(heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_8BIT));
+    if (!inflator) {
+        inflator = static_cast<tinfl_decompressor *>(
+            heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    if (!buf || !inflator) {
+        Serial.println("gunzip: allocation failed");
+        heap_caps_free(buf);
+        heap_caps_free(inflator);
+        return false;
+    }
+
+    tinfl_init(inflator);
+    size_t srcLen = inLen - 8 - pos;
+    size_t dstLen = expectedLen;
+    const tinfl_status status =
+        tinfl_decompress(inflator, src + pos, &srcLen, static_cast<mz_uint8 *>(static_cast<void *>(buf)),
+                         static_cast<mz_uint8 *>(static_cast<void *>(buf)), &dstLen,
+                         TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    heap_caps_free(inflator);
+
+    if (status != TINFL_STATUS_DONE || dstLen != expectedLen ||
+        mz_crc32(MZ_CRC32_INIT, static_cast<const unsigned char *>(static_cast<const void *>(buf)), dstLen) != expectedCrc) {
+        Serial.printf("gunzip failed: status %d, %u/%u bytes\n", static_cast<int>(status), static_cast<unsigned>(dstLen),
+                      static_cast<unsigned>(expectedLen));
+        heap_caps_free(buf);
+        return false;
+    }
+
+    buf[dstLen] = '\0';
+    out = buf;
+    outLen = dstLen;
+    return true;
+}
+
+// GETs `url` over the shared connection into a PSRAM buffer, inflating gzip bodies.
+// On success the caller owns bufferOut (free with heap_caps_free).
+static bool fetchUrlToPsramBuffer(const String &url, char *&bufferOut, size_t &lengthOut, size_t maxBytes) {
+    bufferOut = nullptr;
+    lengthOut = 0;
     if (WiFi.status() != WL_CONNECTED) {
         return false;
     }
 
     for (int attempt = 1; attempt <= 2; ++attempt) {
-        WiFiClientSecure client;
-        client.setInsecure();
-
-        HTTPClient http;
-        setupHttpDefaults(http);
-
-        if (!http.begin(client, url)) {
+        const uint32_t startMs = millis();
+        const bool newConnection = !fplTlsClient.connected();
+        if (!fplHttp.begin(fplTlsClient, url)) {
+            closeFplConnection();
             return false;
         }
+        fplHttp.addHeader("Accept", "application/json");
 
-        const int code = http.GET();
+        const int code = fplHttp.GET();
+        if (newConnection && code > 0) {
+            ++fplHttpStats.tlsHandshakes;
+        }
+        if (code <= 0) {
+            // Also how a kept-alive socket that the server already closed shows up: reconnect and retry once.
+            Serial.printf("GET failed [%s]: %s, attempt %d/2\n", url.c_str(), HTTPClient::errorToString(code).c_str(),
+                          attempt);
+            closeFplConnection();
+            continue;
+        }
         if (code != HTTP_CODE_OK) {
             Serial.printf("GET failed [%s], HTTP %d\n", url.c_str(), code);
-            http.end();
+            closeFplConnection();
             return false;
         }
 
-        DeserializationError err;
-        if (mode == JsonReadMode::StringBody) {
-            const String payload = http.getString();
-            if (payload.length() == 0) {
-                Serial.printf("Empty HTTP payload [%s], attempt %d/2\n", url.c_str(), attempt);
-                http.end();
-                if (attempt == 1) {
-                    delay(200);
-                    continue;
-                }
-                return false;
-            }
-            if (filter) {
-                err = deserializeJson(doc, payload, DeserializationOption::Filter(*filter));
-            } else {
-                err = deserializeJson(doc, payload);
-            }
-
-            if (err) {
-                const size_t previewLen = payload.length() < 200 ? payload.length() : 200;
-                Serial.printf("JSON parse error [%s] attempt %d/2: %s\n", url.c_str(), attempt, err.c_str());
-                Serial.printf("Payload bytes: %u | preview: %.*s\n", static_cast<unsigned>(payload.length()),
-                              static_cast<int>(previewLen), payload.c_str());
-            }
-        } else {
-            if (filter) {
-                err = deserializeJson(doc, *http.getStreamPtr(), DeserializationOption::Filter(*filter));
-            } else {
-                err = deserializeJson(doc, *http.getStreamPtr());
-            }
-
-            if (err) {
-                Serial.printf("JSON parse error [%s] attempt %d/2: %s\n", url.c_str(), attempt, err.c_str());
-            }
-        }
-        http.end();
-
-        if (!err) {
-            return true;
+        PsramBufferSink sink(maxBytes);
+        const int contentLen = fplHttp.getSize();
+        if (!sink.reserve(contentLen > 0 ? static_cast<size_t>(contentLen) : 16384U)) {
+            Serial.printf("PSRAM alloc failed [%s]\n", url.c_str());
+            closeFplConnection();
+            return false;
         }
 
-        // transient short reads are common on embedded HTTPS; retry once
-        if (attempt == 1 &&
-            (err == DeserializationError::IncompleteInput || err == DeserializationError::EmptyInput)) {
-            delay(200);
+        const int written = fplHttp.writeToStream(&sink);
+        fplHttp.end();
+        if (sink.overflowed()) {
+            Serial.printf("Payload too large [%s] (> %u bytes)\n", url.c_str(), static_cast<unsigned>(maxBytes));
+            closeFplConnection();
+            return false;
+        }
+        if (written <= 0 || sink.length() == 0) {
+            Serial.printf("Body read failed [%s]: %d, attempt %d/2\n", url.c_str(), written, attempt);
+            closeFplConnection();
             continue;
         }
 
-        return false;
-    }
-
-    return false;
-}
-
-static bool fetchUrlToPsramBuffer(const String &url, char *&bufferOut, size_t &lengthOut, size_t maxBytes) {
-    bufferOut = nullptr;
-    lengthOut = 0;
-
-    for (int attempt = 1; attempt <= 2; ++attempt) {
-        WiFiClientSecure client;
-        client.setInsecure();
-
-        HTTPClient http;
-        setupHttpDefaults(http);
-        if (!http.begin(client, url)) {
+        const size_t wireLen = sink.length();
+        char *body = sink.release();
+        size_t bodyLen = wireLen;
+        if (!body) {
+            closeFplConnection();
             return false;
         }
 
-        const int code = http.GET();
-        if (code != HTTP_CODE_OK) {
-            Serial.printf("GET failed [%s], HTTP %d\n", url.c_str(), code);
-            http.end();
-            return false;
-        }
-
-        int contentLen = http.getSize();
-        if (contentLen < 0) {
-            contentLen = 65536;
-        }
-
-        size_t capacity = static_cast<size_t>(contentLen) + 1;
-        if (capacity > maxBytes + 1) {
-            capacity = maxBytes + 1;
-        }
-        if (capacity < 4096) {
-            capacity = 4096;
-        }
-
-        char *buf = static_cast<char *>(heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!buf) {
-            Serial.printf("PSRAM alloc failed [%s]\n", url.c_str());
-            http.end();
-            return false;
-        }
-
-        size_t len = 0;
-        uint8_t chunk[1024];
-        WiFiClient *stream = http.getStreamPtr();
-
-        while (http.connected() || stream->available()) {
-            const int avail = stream->available();
-            if (avail <= 0) {
-                delay(1);
+        const bool gzipped = isGzip(body, bodyLen);
+        if (gzipped) {
+            char *inflated = nullptr;
+            size_t inflatedLen = 0;
+            const bool inflatedOk = gunzipToPsram(body, bodyLen, maxBytes, inflated, inflatedLen);
+            heap_caps_free(body);
+            if (!inflatedOk) {
+                Serial.printf("gunzip failed [%s], attempt %d/2\n", url.c_str(), attempt);
                 continue;
             }
-
-            const size_t want = static_cast<size_t>(avail > static_cast<int>(sizeof(chunk)) ? sizeof(chunk) : avail);
-            const int got = stream->readBytes(chunk, want);
-            if (got <= 0) {
-                continue;
-            }
-
-            if (len + static_cast<size_t>(got) + 1 > capacity) {
-                size_t newCapacity = capacity * 2;
-                if (newCapacity < len + static_cast<size_t>(got) + 1) {
-                    newCapacity = len + static_cast<size_t>(got) + 1;
-                }
-                if (newCapacity > maxBytes + 1) {
-                    newCapacity = maxBytes + 1;
-                }
-
-                if (newCapacity <= capacity) {
-                    Serial.printf("Payload too large [%s] (> %u bytes)\n", url.c_str(), static_cast<unsigned>(maxBytes));
-                    heap_caps_free(buf);
-                    http.end();
-                    return false;
-                }
-
-                char *grown = static_cast<char *>(heap_caps_realloc(buf, newCapacity, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-                if (!grown) {
-                    Serial.printf("PSRAM realloc failed [%s]\n", url.c_str());
-                    heap_caps_free(buf);
-                    http.end();
-                    return false;
-                }
-                buf = grown;
-                capacity = newCapacity;
-            }
-
-            memcpy(buf + len, chunk, static_cast<size_t>(got));
-            len += static_cast<size_t>(got);
-        }
-        http.end();
-
-        if (len == 0) {
-            Serial.printf("Empty HTTP payload [%s], attempt %d/2\n", url.c_str(), attempt);
-            heap_caps_free(buf);
-            if (attempt == 1) {
-                delay(200);
-                continue;
-            }
-            return false;
+            body = inflated;
+            bodyLen = inflatedLen;
         }
 
-        buf[len] = '\0';
-        bufferOut = buf;
-        lengthOut = len;
-        Serial.printf("PSRAM payload [%s]: %u bytes\n", url.c_str(), static_cast<unsigned>(len));
+        ++fplHttpStats.requests;
+        fplHttpStats.wireBytes += wireLen;
+        fplHttpStats.jsonBytes += bodyLen;
+        Serial.printf("GET %s: %u B%s -> %u B json, %lu ms%s\n", url.c_str() + strlen(kFplApiBase),
+                      static_cast<unsigned>(wireLen), gzipped ? " gzip" : "", static_cast<unsigned>(bodyLen),
+                      static_cast<unsigned long>(millis() - startMs), newConnection ? " (new TLS)" : "");
+
+        bufferOut = body;
+        lengthOut = bodyLen;
         return true;
     }
 
@@ -530,11 +643,14 @@ static bool getJsonDocumentFromPsramUrl(const String &url, DynamicJsonDocument &
             return false;
         }
 
+        // Parse from const char* so ArduinoJson copies strings into the document; with a mutable char* it
+        // would point into `payload`, which is freed below.
+        const char *input = payload;
         DeserializationError err;
         if (filter) {
-            err = deserializeJson(doc, payload, payloadLen, DeserializationOption::Filter(*filter));
+            err = deserializeJson(doc, input, payloadLen, DeserializationOption::Filter(*filter));
         } else {
-            err = deserializeJson(doc, payload, payloadLen);
+            err = deserializeJson(doc, input, payloadLen);
         }
         heap_caps_free(payload);
 
@@ -542,7 +658,7 @@ static bool getJsonDocumentFromPsramUrl(const String &url, DynamicJsonDocument &
             return true;
         }
 
-        Serial.printf("JSON parse error [%s] from PSRAM attempt %d/2: %s\n", url.c_str(), attempt, err.c_str());
+        Serial.printf("JSON parse error [%s] attempt %d/2: %s\n", url.c_str(), attempt, err.c_str());
         if (attempt == 1 &&
             (err == DeserializationError::IncompleteInput || err == DeserializationError::EmptyInput)) {
             delay(200);
@@ -553,18 +669,38 @@ static bool getJsonDocumentFromPsramUrl(const String &url, DynamicJsonDocument &
     return false;
 }
 
-static bool fetchEntrySummary(int &currentGwOut, int &overallRankOut, int &overallPointsOut) {
-    DynamicJsonDocument filter(256);
+// ---------------------------------------------------------------------------
+// Endpoint fetchers
+// ---------------------------------------------------------------------------
+struct EntrySummary {
+    int currentGw = 0;
+    int overallRank = 0;
+    int overallPoints = 0;
+    int previousOverallRank = 0;
+};
+
+struct FixtureWindow {
+    bool hasKickoff = false;
+    time_t kickoffUtc = 0;
+    bool finished = false;
+};
+
+static bool fetchEntrySummary(EntrySummary &out) {
+    DynamicJsonDocument filter(384);
     filter["current_event"] = true;
     filter["summary_overall_rank"] = true;
     filter["summary_overall_points"] = true;
+    JsonObject leagueFilter = filter["leagues"]["classic"].createNestedObject();
+    leagueFilter["short_name"] = true;
+    leagueFilter["entry_last_rank"] = true;
 
-    DynamicJsonDocument doc(1024);
-    String url = "https://fantasy.premierleague.com/api/entry/";
+    DynamicJsonDocument doc(8192);
+    String url = kFplApiBase;
+    url += "entry/";
     url += String(FPL_ENTRY_ID);
     url += "/";
 
-    if (!getJsonDocument(url, doc, &filter, JsonReadMode::StringBody)) {
+    if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
         return false;
     }
 
@@ -573,124 +709,19 @@ static bool fetchEntrySummary(int &currentGwOut, int &overallRankOut, int &overa
         return false;
     }
 
-    currentGwOut = doc["current_event"].as<int>();
-    overallRankOut = doc["summary_overall_rank"] | 0;
-    overallPointsOut = doc["summary_overall_points"] | 0;
-    return true;
-}
+    out.currentGw = doc["current_event"].as<int>();
+    out.overallRank = doc["summary_overall_rank"] | 0;
+    out.overallPoints = doc["summary_overall_points"] | 0;
 
-static bool fetchPreviousOverallRank(int currentGw, int &prevRankOut) {
-    DynamicJsonDocument filter(512);
-    JsonArray currentFilter = filter.createNestedArray("current");
-    JsonObject currentEventFilter = currentFilter.createNestedObject();
-    currentEventFilter["event"] = true;
-    currentEventFilter["overall_rank"] = true;
-
-    DynamicJsonDocument doc(16384);
-    String url = "https://fantasy.premierleague.com/api/entry/";
-    url += String(FPL_ENTRY_ID);
-    url += "/history/";
-
-    if (!getJsonDocument(url, doc, &filter, JsonReadMode::StringBody)) {
-        return false;
-    }
-
-    JsonArray current = doc["current"].as<JsonArray>();
-    if (current.isNull() || current.size() == 0) {
-        return false;
-    }
-
-    int bestEvent = -1;
-    int bestRank = 0;
-    const int targetEvent = currentGw - 1;
-    for (JsonObject e : current) {
-        const int ev = e["event"] | 0;
-        const int rank = e["overall_rank"] | 0;
-        if (rank <= 0) {
-            continue;
-        }
-        if (targetEvent > 0 && ev == targetEvent) {
-            prevRankOut = rank;
-            return true;
-        }
-        if (ev < currentGw && ev > bestEvent) {
-            bestEvent = ev;
-            bestRank = rank;
+    // The system "overall" league carries last gameweek's overall rank, which replaces entry/{id}/history/.
+    out.previousOverallRank = 0;
+    for (JsonObject league : doc["leagues"]["classic"].as<JsonArray>()) {
+        const char *shortName = league["short_name"] | "";
+        if (strcmp(shortName, "overall") == 0) {
+            out.previousOverallRank = league["entry_last_rank"] | 0;
+            break;
         }
     }
-
-    if (bestEvent > 0 && bestRank > 0) {
-        prevRankOut = bestRank;
-        return true;
-    }
-    return false;
-}
-
-static bool fetchGameweekState(bool &isLiveOut, int &nextGwOut, bool &hasDeadlineOut, time_t &deadlineOut) {
-    DynamicJsonDocument filter(512);
-    JsonArray eventsFilter = filter.createNestedArray("events");
-    JsonObject eventFilter = eventsFilter.createNestedObject();
-    eventFilter["id"] = true;
-    eventFilter["is_current"] = true;
-    eventFilter["is_next"] = true;
-    eventFilter["finished"] = true;
-    eventFilter["deadline_time"] = true;
-    eventFilter["deadline_time_epoch"] = true;
-
-    DynamicJsonDocument doc(8192);
-    const String url = "https://fantasy.premierleague.com/api/bootstrap-static/";
-    if (!getJsonDocumentFromPsramUrl(url, doc, FPL_BOOTSTRAP_PSRAM_MAX_BYTES, &filter)) {
-        return false;
-    }
-
-    JsonArray events = doc["events"].as<JsonArray>();
-    if (events.isNull()) {
-        Serial.println("bootstrap response missing events");
-        return false;
-    }
-
-    bool foundCurrent = false;
-    bool foundNext = false;
-    bool currentFinished = false;
-    int nextGw = 0;
-    bool hasDeadline = false;
-    time_t parsedDeadline = 0;
-
-    for (JsonObject e : events) {
-        if (e["is_current"] | false) {
-            foundCurrent = true;
-            currentFinished = e["finished"] | false;
-        }
-        if (e["is_next"] | false) {
-            foundNext = true;
-            nextGw = e["id"] | 0;
-            const char *deadlineIso = e["deadline_time"] | nullptr;
-            if (parseIsoUtcToEpoch(deadlineIso, parsedDeadline)) {
-                hasDeadline = true;
-            } else {
-                const int64_t epoch = e["deadline_time_epoch"] | 0;
-                if (epoch > 0) {
-                    parsedDeadline = static_cast<time_t>(epoch);
-                    hasDeadline = true;
-                    Serial.printf("Using deadline_time_epoch fallback for GW%d: %lld\n", nextGw,
-                                  static_cast<long long>(epoch));
-                } else {
-                    Serial.printf("Failed to parse deadline_time for GW%d: %s\n", nextGw,
-                                  deadlineIso ? deadlineIso : "null");
-                }
-            }
-        }
-    }
-
-    if (!foundCurrent && !foundNext) {
-        return false;
-    }
-
-    // Proxy for live state from bootstrap event flags.
-    isLiveOut = foundCurrent && !currentFinished;
-    nextGwOut = foundNext ? nextGw : 0;
-    hasDeadlineOut = hasDeadline;
-    deadlineOut = parsedDeadline;
     return true;
 }
 
@@ -705,13 +736,14 @@ static bool fetchPicksForGw(int gw, TeamPick *picks, size_t picksCapacity, size_
     pickFilter["is_vice_captain"] = true;
 
     DynamicJsonDocument doc(8192);
-    String url = "https://fantasy.premierleague.com/api/entry/";
+    String url = kFplApiBase;
+    url += "entry/";
     url += String(FPL_ENTRY_ID);
     url += "/event/";
     url += String(gw);
     url += "/picks/";
 
-    if (!getJsonDocument(url, doc, &filter, JsonReadMode::StringBody)) {
+    if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
         return false;
     }
 
@@ -729,6 +761,7 @@ static bool fetchPicksForGw(int gw, TeamPick *picks, size_t picksCapacity, size_
             break;
         }
         TeamPick &pick = picks[pickCountOut++];
+        pick = TeamPick{};
         pick.elementId = p["element"] | 0;
         pick.squadPosition = p["position"] | 0;
         pick.multiplier = p["multiplier"] | 0;
@@ -737,6 +770,39 @@ static bool fetchPicksForGw(int gw, TeamPick *picks, size_t picksCapacity, size_
     }
 
     return pickCountOut > 0;
+}
+
+static bool fetchFixturesForGw(int gw, FixtureWindow *fixtures, size_t capacity, size_t &countOut) {
+    DynamicJsonDocument filter(128);
+    JsonObject fixtureFilter = filter.createNestedObject();
+    fixtureFilter["kickoff_time"] = true;
+    fixtureFilter["finished"] = true;
+
+    DynamicJsonDocument doc(8192);
+    String url = kFplApiBase;
+    url += "fixtures/?event=";
+    url += String(gw);
+
+    if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
+        return false;
+    }
+
+    JsonArray items = doc.as<JsonArray>();
+    if (items.isNull()) {
+        Serial.println("fixtures response is not an array");
+        return false;
+    }
+
+    countOut = 0;
+    for (JsonObject f : items) {
+        if (countOut >= capacity) {
+            break;
+        }
+        FixtureWindow &w = fixtures[countOut++];
+        w.hasKickoff = parseIsoUtcToEpoch(f["kickoff_time"] | nullptr, w.kickoffUtc);
+        w.finished = f["finished"] | false;
+    }
+    return true;
 }
 
 static bool fetchLivePointsForPicks(int gw, TeamPick *picks, size_t pickCount) {
@@ -881,56 +947,131 @@ static void normalizeKitTeamSlug(char *slug, size_t slugLen) {
     }
 }
 
-static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
-    DynamicJsonDocument filter(1152);
-    JsonArray elementsFilter = filter.createNestedArray("elements");
-    JsonObject elementFilter = elementsFilter.createNestedObject();
-    elementFilter["id"] = true;
-    elementFilter["web_name"] = true;
-    elementFilter["element_type"] = true;
-    elementFilter["team"] = true;
+#endif
 
-    JsonArray typesFilter = filter.createNestedArray("element_types");
-    JsonObject typeFilter = typesFilter.createNestedObject();
-    typeFilter["id"] = true;
-    typeFilter["singular_name_short"] = true;
+struct GameweekState {
+    int currentGw = 0;
+    bool isLiveGw = false;
+    int nextGw = 0;
+    bool hasDeadline = false;
+    time_t deadlineUtc = 0;
+};
 
-    JsonArray teamsFilter = filter.createNestedArray("teams");
-    JsonObject teamFilter = teamsFilter.createNestedObject();
-    teamFilter["id"] = true;
-    teamFilter["name"] = true;
+struct PlayerMeta {
+    int elementId = 0;
+    int elementType = 0;
+    int teamId = 0;
+    String playerName;
+    String positionName;
+    char teamShortName[24] = "";
+};
 
-    DynamicJsonDocument doc(90000);
-    const String url = "https://fantasy.premierleague.com/api/bootstrap-static/";
+// One bootstrap-static download for the gameweek flags/deadline and, when metaOut is given, the names,
+// positions and kit slugs of the squad's players.
+static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_t pickCount, PlayerMeta *metaOut,
+                           size_t &metaCountOut) {
+    const bool wantMeta = metaOut != nullptr;
+
+    DynamicJsonDocument filter(1536);
+    JsonObject eventFilter = filter["events"].createNestedObject();
+    eventFilter["id"] = true;
+    eventFilter["is_current"] = true;
+    eventFilter["is_next"] = true;
+    eventFilter["finished"] = true;
+    eventFilter["deadline_time"] = true;
+    eventFilter["deadline_time_epoch"] = true;
+    if (wantMeta) {
+        JsonObject elementFilter = filter["elements"].createNestedObject();
+        elementFilter["id"] = true;
+        elementFilter["web_name"] = true;
+        elementFilter["element_type"] = true;
+        elementFilter["team"] = true;
+        JsonObject typeFilter = filter["element_types"].createNestedObject();
+        typeFilter["id"] = true;
+        typeFilter["singular_name_short"] = true;
+        JsonObject teamFilter = filter["teams"].createNestedObject();
+        teamFilter["id"] = true;
+        teamFilter["name"] = true;
+    }
+
+    DynamicJsonDocument doc(wantMeta ? 110000 : 8192);
+    String url = kFplApiBase;
+    url += "bootstrap-static/";
     if (!getJsonDocumentFromPsramUrl(url, doc, FPL_BOOTSTRAP_PSRAM_MAX_BYTES, &filter)) {
         return false;
     }
 
+    JsonArray events = doc["events"].as<JsonArray>();
+    if (events.isNull()) {
+        Serial.println("bootstrap response missing events");
+        return false;
+    }
+
+    GameweekState state;
+    bool foundCurrent = false;
+    bool foundNext = false;
+    bool currentFinished = false;
+    for (JsonObject e : events) {
+        if (e["is_current"] | false) {
+            foundCurrent = true;
+            state.currentGw = e["id"] | 0;
+            currentFinished = e["finished"] | false;
+        }
+        if (e["is_next"] | false) {
+            foundNext = true;
+            state.nextGw = e["id"] | 0;
+            const char *deadlineIso = e["deadline_time"] | nullptr;
+            if (parseIsoUtcToEpoch(deadlineIso, state.deadlineUtc)) {
+                state.hasDeadline = true;
+            } else {
+                const int64_t epoch = e["deadline_time_epoch"] | 0;
+                if (epoch > 0) {
+                    state.deadlineUtc = static_cast<time_t>(epoch);
+                    state.hasDeadline = true;
+                    Serial.printf("Using deadline_time_epoch fallback for GW%d: %lld\n", state.nextGw,
+                                  static_cast<long long>(epoch));
+                } else {
+                    Serial.printf("Failed to parse deadline_time for GW%d: %s\n", state.nextGw,
+                                  deadlineIso ? deadlineIso : "null");
+                }
+            }
+        }
+    }
+
+    if (!foundCurrent && !foundNext) {
+        return false;
+    }
+    // Proxy for live state from bootstrap event flags.
+    state.isLiveGw = foundCurrent && !currentFinished;
+    stateOut = state;
+
+    if (!wantMeta) {
+        return true;
+    }
+
+#if FPL_ENABLE_NAME_LOOKUP
     struct TypeName {
-        int id;
-        const char *name;
+        int id = 0;
+        char name[8] = "?";
     };
     TypeName typeNames[8];
     size_t typeCount = 0;
+    for (JsonObject t : doc["element_types"].as<JsonArray>()) {
+        if (typeCount >= (sizeof(typeNames) / sizeof(typeNames[0]))) {
+            break;
+        }
+        typeNames[typeCount].id = t["id"] | 0;
+        strlcpy(typeNames[typeCount].name, t["singular_name_short"] | "?", sizeof(typeNames[typeCount].name));
+        ++typeCount;
+    }
+
     struct TeamShort {
         int id = 0;
         char slug[24] = "";
     };
     TeamShort teamNames[24];
     size_t teamCount = 0;
-
-    JsonArray types = doc["element_types"].as<JsonArray>();
-    for (JsonObject t : types) {
-        if (typeCount >= (sizeof(typeNames) / sizeof(typeNames[0]))) {
-            break;
-        }
-        typeNames[typeCount].id = t["id"] | 0;
-        typeNames[typeCount].name = t["singular_name_short"] | "?";
-        ++typeCount;
-    }
-
-    JsonArray teams = doc["teams"].as<JsonArray>();
-    for (JsonObject t : teams) {
+    for (JsonObject t : doc["teams"].as<JsonArray>()) {
         if (teamCount >= (sizeof(teamNames) / sizeof(teamNames[0]))) {
             break;
         }
@@ -940,38 +1081,41 @@ static bool fetchPlayerMetaForPicks(TeamPick *picks, size_t pickCount) {
         ++teamCount;
     }
 
-    JsonArray elements = doc["elements"].as<JsonArray>();
-    for (JsonObject e : elements) {
+    metaCountOut = 0;
+    for (JsonObject e : doc["elements"].as<JsonArray>()) {
         const int id = e["id"] | 0;
         for (size_t i = 0; i < pickCount; ++i) {
             if (picks[i].elementId != id) {
                 continue;
             }
-            picks[i].playerName = e["web_name"] | "unknown";
-            const int typeId = e["element_type"] | 0;
-            picks[i].elementType = typeId;
-            picks[i].teamId = e["team"] | 0;
-            picks[i].teamShortName[0] = '\0';
-            picks[i].positionName = "?";
+            PlayerMeta &meta = metaOut[metaCountOut++];
+            meta = PlayerMeta{};
+            meta.elementId = id;
+            meta.playerName = e["web_name"] | "unknown";
+            meta.elementType = e["element_type"] | 0;
+            meta.teamId = e["team"] | 0;
+            meta.positionName = "?";
             for (size_t j = 0; j < typeCount; ++j) {
-                if (typeNames[j].id == typeId) {
-                    picks[i].positionName = typeNames[j].name;
+                if (typeNames[j].id == meta.elementType) {
+                    meta.positionName = typeNames[j].name;
                     break;
                 }
             }
             for (size_t j = 0; j < teamCount; ++j) {
-                if (teamNames[j].id == picks[i].teamId) {
-                    strlcpy(picks[i].teamShortName, teamNames[j].slug, sizeof(picks[i].teamShortName));
+                if (teamNames[j].id == meta.teamId) {
+                    strlcpy(meta.teamShortName, teamNames[j].slug, sizeof(meta.teamShortName));
                     break;
                 }
             }
             break;
         }
+        if (metaCountOut >= pickCount) {
+            break;
+        }
     }
-
+#endif
     return true;
 }
-#endif
 
 static const char *pickDisplayName(const TeamPick &pick, char *buf, size_t bufSize) {
     if (pick.playerName.length()) {
@@ -1588,55 +1732,302 @@ static int computeGwPointsFromPicks(const TeamPick *picks, size_t pickCount) {
     return computedGwPoints;
 }
 
-static bool fetchTeamSnapshot(TeamSnapshot &out) {
-    int currentGw = 0;
-    int overallRank = 0;
-    int overallPoints = 0;
-    if (!fetchEntrySummary(currentGw, overallRank, overallPoints)) {
-        return false;
-    }
+// ---------------------------------------------------------------------------
+// Poll cache + scheduling
+// Each endpoint is refetched only when its data can have changed (intervals in fpl_config.h):
+//   entry/{id}/              every poll (current GW, total points, overall rank and last rank)
+//   entry/{id}/event/picks/  new GW or every FPL_PICKS_REFRESH_MS (auto-subs change multipliers)
+//   bootstrap-static/        first poll, GW change, deadline passed, unknown players, or FPL_BOOTSTRAP_REFRESH_MS
+//   fixtures/?event={gw}     new GW or every FPL_FIXTURES_REFRESH_MS
+//   event/{gw}/live/         while a match is in play, when a fixture is newly finished, or FPL_LIVE_IDLE_REFRESH_MS
+// Polls run every FPL_POLL_INTERVAL_MS while a match is in play, otherwise every FPL_IDLE_POLL_INTERVAL_MS
+// (woken early for the next kickoff or deadline).
+// ---------------------------------------------------------------------------
+static constexpr size_t kMaxFixtures = 24;
+static constexpr time_t kMinValidEpoch = 1700000000;
+// A fixture counts as in play from kickoff until FPL marks it finished; capped in case it was abandoned.
+static constexpr time_t kFixtureInPlayMaxSec = 6 * 3600;
+// bootstrap-static is served with Cache-Control: max-age=300, so refetching sooner returns the same copy.
+static constexpr uint32_t kBootstrapMinSpacingMs = 5UL * 60UL * 1000UL;
+static constexpr time_t kPostDeadlineWakeSec = 60;
 
+struct FplDataCache {
+    bool hasEntry = false;
+    EntrySummary entry;
+
+    bool hasGwState = false;
+    GameweekState gwState;
+    uint32_t bootstrapFetchedMs = 0;
+    time_t bootstrapFetchedUtc = 0;
+    PlayerMeta meta[16];
+    size_t metaCount = 0;
+    bool hasPlayerMeta = false;
+
+    int picksGw = 0;
+    uint32_t picksFetchedMs = 0;
+    TeamPick picks[16];
     size_t pickCount = 0;
     String activeChip;
-    if (!fetchPicksForGw(currentGw, out.picks, 16, pickCount, activeChip)) {
-        return false;
-    }
-    if (!fetchLivePointsForPicks(currentGw, out.picks, pickCount)) {
-        return false;
-    }
 
-    bool hasPlayerMeta = false;
+    int fixturesGw = 0;
+    uint32_t fixturesFetchedMs = 0;
+    FixtureWindow fixtures[kMaxFixtures];
+    size_t fixtureCount = 0;
+
+    int liveGw = 0;
+    uint32_t liveFetchedMs = 0;
+    size_t liveFinishedFixtures = 0;
+};
+static FplDataCache fplCache;  // guarded by fplDataMutex
+
+struct FplPollResult {
+    bool liveFetched = false;
+    bool matchInPlay = false;
+    uint32_t nextPollDelayMs = FPL_POLL_INTERVAL_MS;
+};
+
+static bool elapsedAtLeast(uint32_t sinceMs, uint32_t intervalMs) {
+    return sinceMs == 0 || millis() - sinceMs >= intervalMs;
+}
+
 #if FPL_ENABLE_NAME_LOOKUP
-    hasPlayerMeta = fetchPlayerMetaForPicks(out.picks, pickCount);
+// Copies cached names/positions/teams onto picks; false if any pick has no cached meta.
+static bool applyPlayerMeta(TeamPick *picks, size_t pickCount, const PlayerMeta *meta, size_t metaCount) {
+    bool allFound = true;
+    for (size_t i = 0; i < pickCount; ++i) {
+        bool found = false;
+        for (size_t j = 0; j < metaCount; ++j) {
+            if (meta[j].elementId != picks[i].elementId) {
+                continue;
+            }
+            picks[i].playerName = meta[j].playerName;
+            picks[i].positionName = meta[j].positionName;
+            picks[i].elementType = meta[j].elementType;
+            picks[i].teamId = meta[j].teamId;
+            strlcpy(picks[i].teamShortName, meta[j].teamShortName, sizeof(picks[i].teamShortName));
+            found = true;
+            break;
+        }
+        allFound = allFound && found;
+    }
+    return allFound;
+}
 #endif
 
-    out.currentGw = currentGw;
-    out.overallRank = overallRank;
-    out.overallPoints = overallPoints;
-    out.pickCount = pickCount;
-    out.activeChip = activeChip;
-    out.hasPlayerMeta = hasPlayerMeta;
-    out.gwPoints = computeGwPointsFromPicks(out.picks, out.pickCount);
+// Copies live stats from the previous picks of the same GW; false if a player is new to the squad.
+static bool carryOverLiveStats(TeamPick *picks, size_t pickCount, const TeamPick *previous, size_t previousCount) {
+    bool allFound = true;
+    for (size_t i = 0; i < pickCount; ++i) {
+        bool found = false;
+        for (size_t j = 0; j < previousCount; ++j) {
+            if (previous[j].elementId == picks[i].elementId) {
+                picks[i].live = previous[j].live;
+                found = true;
+                break;
+            }
+        }
+        allFound = allFound && found;
+    }
+    return allFound;
+}
+
+static uint32_t computeNextPollDelayMs(const FplDataCache &c, bool matchInPlay, bool clockValid, time_t nowUtc) {
+    if (matchInPlay || !clockValid) {
+        return FPL_POLL_INTERVAL_MS;
+    }
+
+    uint64_t delayMs = FPL_IDLE_POLL_INTERVAL_MS;
+    auto wakeAt = [&](time_t eventUtc) {
+        if (eventUtc <= nowUtc) {
+            return;
+        }
+        const uint64_t untilMs = static_cast<uint64_t>(eventUtc - nowUtc) * 1000ULL;
+        if (untilMs < delayMs) {
+            delayMs = untilMs;
+        }
+    };
+    if (c.fixturesGw == c.entry.currentGw) {
+        for (size_t i = 0; i < c.fixtureCount; ++i) {
+            if (c.fixtures[i].hasKickoff && !c.fixtures[i].finished) {
+                wakeAt(c.fixtures[i].kickoffUtc);
+            }
+        }
+    }
+    if (c.hasGwState && c.gwState.hasDeadline) {
+        wakeAt(c.gwState.deadlineUtc + kPostDeadlineWakeSec);
+    }
+
+    if (delayMs < FPL_POLL_INTERVAL_MS) {
+        delayMs = FPL_POLL_INTERVAL_MS;
+    }
+    return static_cast<uint32_t>(delayMs);
+}
+
+static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
+    const time_t nowUtc = time(nullptr);
+    const bool clockValid = nowUtc >= kMinValidEpoch;
+
+    // 1) entry/{id}/ every poll.
+    EntrySummary entry;
+    if (!fetchEntrySummary(entry)) {
+        return false;
+    }
+    c.entry = entry;
+    c.hasEntry = true;
+    const int gw = entry.currentGw;
+
+    // 2) picks: change at the deadline and when auto-subs are applied.
+    bool squadChanged = false;
+    if (c.picksGw != gw || elapsedAtLeast(c.picksFetchedMs, FPL_PICKS_REFRESH_MS)) {
+        static TeamPick fresh[16];  // static: keeps ~3 KB off the task stack (fplDataMutex is held)
+        size_t freshCount = 0;
+        String chip;
+        if (fetchPicksForGw(gw, fresh, 16, freshCount, chip)) {
+            squadChanged = !(c.picksGw == gw && carryOverLiveStats(fresh, freshCount, c.picks, c.pickCount));
+            for (size_t i = 0; i < freshCount; ++i) {
+                c.picks[i] = fresh[i];
+            }
+            c.pickCount = freshCount;
+            c.activeChip = chip;
+            c.picksGw = gw;
+            c.picksFetchedMs = millis();
+        } else if (c.picksGw != gw) {
+            return false;
+        }
+    }
+#if FPL_ENABLE_NAME_LOOKUP
+    c.hasPlayerMeta = applyPlayerMeta(c.picks, c.pickCount, c.meta, c.metaCount);
+#endif
+
+    // 3) bootstrap-static (1.7 MB, ~160 KB gzipped).
+    const bool deadlinePassed = c.hasGwState && c.gwState.hasDeadline && clockValid &&
+                                nowUtc >= c.gwState.deadlineUtc && c.bootstrapFetchedUtc < c.gwState.deadlineUtc;
+    bool needMeta = false;
+#if FPL_ENABLE_NAME_LOOKUP
+    needMeta = !c.hasPlayerMeta;
+#endif
+    const bool gwMismatch = c.hasGwState && c.gwState.currentGw != gw;
+    if (!c.hasGwState || elapsedAtLeast(c.bootstrapFetchedMs, FPL_BOOTSTRAP_REFRESH_MS) ||
+        ((needMeta || gwMismatch || deadlinePassed) && elapsedAtLeast(c.bootstrapFetchedMs, kBootstrapMinSpacingMs))) {
+        GameweekState state;
+        size_t metaCount = 0;
+        PlayerMeta *metaOut = nullptr;
+#if FPL_ENABLE_NAME_LOOKUP
+        metaOut = c.meta;
+#endif
+        if (fetchBootstrap(state, c.picks, c.pickCount, metaOut, metaCount)) {
+            c.gwState = state;
+            c.hasGwState = true;
+            c.bootstrapFetchedMs = millis();
+            c.bootstrapFetchedUtc = clockValid ? nowUtc : 0;
+#if FPL_ENABLE_NAME_LOOKUP
+            c.metaCount = metaCount;
+            c.hasPlayerMeta = applyPlayerMeta(c.picks, c.pickCount, c.meta, c.metaCount);
+#endif
+        }
+    }
+
+    // 4) fixtures: kickoff times and finished flags decide whether live data can be changing.
+    if (c.fixturesGw != gw || elapsedAtLeast(c.fixturesFetchedMs, FPL_FIXTURES_REFRESH_MS)) {
+        size_t count = 0;
+        if (fetchFixturesForGw(gw, c.fixtures, kMaxFixtures, count)) {
+            c.fixtureCount = count;
+            c.fixturesGw = gw;
+            c.fixturesFetchedMs = millis();
+        }
+    }
+
+    // Without fixtures or a synced clock, fall back to treating the GW as in play (fetch live every poll).
+    const bool haveFixtures = c.fixturesGw == gw;
+    bool matchInPlay = !haveFixtures || !clockValid;
+    size_t finishedFixtures = 0;
+    if (haveFixtures) {
+        for (size_t i = 0; i < c.fixtureCount; ++i) {
+            const FixtureWindow &f = c.fixtures[i];
+            if (f.finished) {
+                ++finishedFixtures;
+            } else if (clockValid && f.hasKickoff && nowUtc >= f.kickoffUtc &&
+                       nowUtc - f.kickoffUtc < kFixtureInPlayMaxSec) {
+                matchInPlay = true;
+            }
+        }
+    }
+    result.matchInPlay = matchInPlay;
+
+    // 5) event/{gw}/live/. A newly finished fixture means confirmed bonus, so fetch once more after it.
+    if (c.liveGw != gw || squadChanged || matchInPlay || finishedFixtures != c.liveFinishedFixtures ||
+        elapsedAtLeast(c.liveFetchedMs, FPL_LIVE_IDLE_REFRESH_MS)) {
+        if (fetchLivePointsForPicks(gw, c.picks, c.pickCount)) {
+            c.liveGw = gw;
+            c.liveFetchedMs = millis();
+            c.liveFinishedFixtures = finishedFixtures;
+            result.liveFetched = true;
+        } else if (c.liveGw != gw) {
+            return false;
+        }
+    }
+
+    result.nextPollDelayMs = computeNextPollDelayMs(c, matchInPlay, clockValid, nowUtc);
     return true;
 }
 
-static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = nullptr, int *overallPointsOut = nullptr) {
-    TeamSnapshot snapshot;
-    if (!fetchTeamSnapshot(snapshot)) {
+// Refreshes fplCache over one kept-alive connection. Caller must hold fplDataMutex.
+static bool refreshFplData(FplPollResult &result) {
+    result = FplPollResult{};
+    fplHttpStats = FplHttpStats{};
+    const uint32_t startMs = millis();
+
+    const bool ok = refreshFplDataSteps(fplCache, result);
+    closeFplConnection();
+
+    Serial.printf("[FPL poll] %s in %lu ms | %u requests, %u TLS handshakes, %u B wire, %u B json | "
+                  "match in play: %s | next poll in %lu s\n",
+                  ok ? "ok" : "FAILED", static_cast<unsigned long>(millis() - startMs),
+                  static_cast<unsigned>(fplHttpStats.requests), static_cast<unsigned>(fplHttpStats.tlsHandshakes),
+                  static_cast<unsigned>(fplHttpStats.wireBytes), static_cast<unsigned>(fplHttpStats.jsonBytes),
+                  result.matchInPlay ? "yes" : "no",
+                  static_cast<unsigned long>((ok ? result.nextPollDelayMs : FPL_POLL_INTERVAL_MS) / 1000UL));
+    return ok;
+}
+
+static void fillSnapshotFromCache(const FplDataCache &c, TeamSnapshot &out) {
+    out.currentGw = c.entry.currentGw;
+    out.overallRank = c.entry.overallRank;
+    out.overallPoints = c.entry.overallPoints;
+    out.hasRankData = c.entry.overallRank > 0 && c.entry.previousOverallRank > 0;
+    // Positive means improvement (rank number got smaller).
+    out.rankDiff = out.hasRankData ? c.entry.previousOverallRank - c.entry.overallRank : 0;
+    out.hasGwState = c.hasGwState;
+    out.isLiveGw = c.gwState.isLiveGw;
+    out.nextGw = c.gwState.nextGw;
+    out.hasDeadline = c.gwState.hasDeadline;
+    out.deadlineUtc = c.gwState.deadlineUtc;
+    out.activeChip = c.activeChip;
+    out.hasPlayerMeta = c.hasPlayerMeta;
+    out.pickCount = c.pickCount;
+    for (size_t i = 0; i < c.pickCount; ++i) {
+        out.picks[i] = c.picks[i];
+    }
+    out.gwPoints = computeGwPointsFromPicks(out.picks, out.pickCount);
+}
+
+// Used by `demo seed`: runs a normal cache-aware refresh and copies the result.
+static bool fetchTeamSnapshot(TeamSnapshot &out) {
+    if (!fplDataMutex || xSemaphoreTake(fplDataMutex, pdMS_TO_TICKS(120000)) != pdTRUE) {
         return false;
     }
-
-    updateSharedSquadFromPicks(snapshot.picks, snapshot.pickCount);
-
-    if (kUseServerEventBreakdown) {
-        detectAndNotifyPointChangesFromBreakdown(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
-    } else {
-        detectAndNotifyPointChanges(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
+    FplPollResult result;
+    const bool ok = refreshFplData(result);
+    if (ok) {
+        fillSnapshotFromCache(fplCache, out);
     }
-    gwPointsOut = snapshot.gwPoints;
+    xSemaphoreGive(fplDataMutex);
+    return ok;
+}
 
+static void printTeamSnapshot(TeamSnapshot &snapshot) {
     Serial.println("\n=== FPL Team Snapshot ===");
-    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", FPL_ENTRY_ID, snapshot.currentGw, gwPointsOut);
+    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", FPL_ENTRY_ID, snapshot.currentGw, snapshot.gwPoints);
     if (snapshot.overallRank > 0) {
         Serial.printf("Overall rank: %d\n", snapshot.overallRank);
     }
@@ -1665,54 +2056,18 @@ static bool fetchAndPrintTeamSnapshot(int &gwPointsOut, int *currentGwOut = null
                           p.playerName.length() ? p.playerName.c_str() : "unknown",
                           p.positionName.length() ? p.positionName.c_str() : "?", currPoints, p.elementId,
                           p.multiplier, p.isCaptain ? " C" : "", p.isViceCaptain ? " VC" : "", effectivePoints);
-            if (showBonusState) {
-                Serial.printf(" | bonus:%d(%s)", p.live.bonus, bonusState);
-            }
-            Serial.println();
-            Serial.printf("       breakdown: %s\n", breakdown);
         } else {
             Serial.printf("  [%2d] %-5s | curr:%2d | element:%4d | mult:%d%s%s | eff:%2d", p.squadPosition, slot,
                           currPoints, p.elementId, p.multiplier, p.isCaptain ? " C" : "",
                           p.isViceCaptain ? " VC" : "", effectivePoints);
-            if (showBonusState) {
-                Serial.printf(" | bonus:%d(%s)", p.live.bonus, bonusState);
-            }
-            Serial.println();
-            Serial.printf("       breakdown: %s\n", breakdown);
         }
+        if (showBonusState) {
+            Serial.printf(" | bonus:%d(%s)", p.live.bonus, bonusState);
+        }
+        Serial.println();
+        Serial.printf("       breakdown: %s\n", breakdown);
     }
     Serial.println("=========================\n");
-
-    if (currentGwOut) {
-        *currentGwOut = snapshot.currentGw;
-    }
-    if (overallPointsOut) {
-        *overallPointsOut = snapshot.overallPoints;
-    }
-
-    return true;
-}
-
-static bool fetchRankDelta(int &overallRankOut, int &rankDiffOut) {
-    int currentGw = 0;
-    int overallRank = 0;
-    int overallPoints = 0;
-    if (!fetchEntrySummary(currentGw, overallRank, overallPoints)) {
-        return false;
-    }
-    if (overallRank <= 0) {
-        return false;
-    }
-
-    int previousRank = 0;
-    if (!fetchPreviousOverallRank(currentGw, previousRank) || previousRank <= 0) {
-        return false;
-    }
-
-    // Positive means improvement (rank number got smaller).
-    overallRankOut = overallRank;
-    rankDiffOut = previousRank - overallRank;
-    return true;
 }
 
 static void lvglFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
@@ -3158,21 +3513,19 @@ static void handleSerialCommandLine(char *line) {
             }
             ensureUkTimeConfigured();
 
-            TeamSnapshot snapshot;
+            static TeamSnapshot snapshot;  // static: too large for the serial task stack
             if (!fetchTeamSnapshot(snapshot)) {
                 Serial.println("[DEMO] Seed failed: could not fetch team snapshot");
                 return;
             }
 
-            bool isLive = false;
-            int nextGw = 0;
-            bool hasDeadline = false;
-            time_t deadlineUtc = 0;
-            fetchGameweekState(isLive, nextGw, hasDeadline, deadlineUtc);
-
-            int rank = snapshot.overallRank;
-            int rankDiff = 0;
-            const bool hasRankData = fetchRankDelta(rank, rankDiff);
+            const bool isLive = snapshot.isLiveGw;
+            const int nextGw = snapshot.nextGw;
+            const bool hasDeadline = snapshot.hasDeadline;
+            const time_t deadlineUtc = snapshot.deadlineUtc;
+            const int rank = snapshot.overallRank;
+            const int rankDiff = snapshot.rankDiff;
+            const bool hasRankData = snapshot.hasRankData;
 
             DemoState updated;
             if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(200)) != pdTRUE) {
@@ -3698,7 +4051,10 @@ static void fplTask(void *) {
     lastPollMs = 0;
     lastWifiRetryMs = 0;
     uint32_t lastSuccessMs = 0;
+    uint32_t pollDelayMs = 0;
+    uint32_t lastSuccessPollDelayMs = FPL_POLL_INTERVAL_MS;
     bool demoModeAnnounced = false;
+    static TeamSnapshot snapshot;  // static: keeps ~3 KB off the task stack
     setSharedStatus("Connecting WiFi...", 0xFFCC66);
 
     for (;;) {
@@ -3727,6 +4083,7 @@ static void fplTask(void *) {
                 if (connectWiFi()) {
                     ensureUkTimeConfigured();
                     setSharedStatus("WiFi connected", 0x38D39F);
+                    pollDelayMs = 0;  // refresh as soon as we are back online
                 } else {
                     setSharedStatus("WiFi not connected", 0xFF5A5A);
                 }
@@ -3735,40 +4092,57 @@ static void fplTask(void *) {
             continue;
         }
 
-        if (lastPollMs == 0 || now - lastPollMs >= FPL_POLL_INTERVAL_MS) {
+        if (lastPollMs == 0 || now - lastPollMs >= pollDelayMs) {
             lastPollMs = now;
             setSharedStatus("Fetching FPL points...", 0xFFCC66);
 
-            bool isLive = false;
-            int nextGw = 0;
-            bool hasDeadline = false;
-            time_t deadlineUtc = 0;
-            if (fetchGameweekState(isLive, nextGw, hasDeadline, deadlineUtc)) {
-                char gwStateBuf[48];
-                snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", isLive ? "yes" : "no", nextGw);
-                setSharedGwStateText(gwStateBuf);
-                Serial.printf("GW state: live=%s next=%d\n", isLive ? "yes" : "no", nextGw);
-            } else {
-                setSharedGwStateText("GW live: ? | next: --");
+            FplPollResult result;
+            bool ok = false;
+            if (xSemaphoreTake(fplDataMutex, portMAX_DELAY) == pdTRUE) {
+                ok = refreshFplData(result);
+                if (ok) {
+                    fillSnapshotFromCache(fplCache, snapshot);
+                }
+                xSemaphoreGive(fplDataMutex);
             }
 
-            int gwPoints = 0;
-            int currentGw = 0;
-            int totalPoints = 0;
-            if (fetchAndPrintTeamSnapshot(gwPoints, &currentGw, &totalPoints)) {
-                setSharedGwPoints(gwPoints);
-                int overallRank = 0;
-                int rankDiff = 0;
-                const bool hasRank = fetchRankDelta(overallRank, rankDiff);
-                setSharedRankData(overallRank, rankDiff, hasRank);
-                setSharedGameweekContext(isLive, currentGw, nextGw, nextGw > 0, deadlineUtc, hasDeadline);
-                setSharedTotalPoints(totalPoints, true);
+            if (ok) {
+                pollDelayMs = result.nextPollDelayMs;
+                lastSuccessPollDelayMs = pollDelayMs;
+
+                if (snapshot.hasGwState) {
+                    char gwStateBuf[48];
+                    snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", snapshot.isLiveGw ? "yes" : "no",
+                             snapshot.nextGw);
+                    setSharedGwStateText(gwStateBuf);
+                    Serial.printf("GW state: live=%s next=%d\n", snapshot.isLiveGw ? "yes" : "no", snapshot.nextGw);
+                } else {
+                    setSharedGwStateText("GW live: ? | next: --");
+                }
+
+                updateSharedSquadFromPicks(snapshot.picks, snapshot.pickCount);
+                if (kUseServerEventBreakdown) {
+                    detectAndNotifyPointChangesFromBreakdown(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
+                } else {
+                    detectAndNotifyPointChanges(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
+                }
+                if (result.liveFetched) {
+                    printTeamSnapshot(snapshot);
+                }
+
+                setSharedGwPoints(snapshot.gwPoints);
+                setSharedRankData(snapshot.overallRank, snapshot.rankDiff, snapshot.hasRankData);
+                setSharedGameweekContext(snapshot.isLiveGw, snapshot.currentGw, snapshot.nextGw, snapshot.nextGw > 0,
+                                         snapshot.deadlineUtc, snapshot.hasDeadline);
+                setSharedTotalPoints(snapshot.overallPoints, true);
                 lastSuccessMs = now;
                 setSharedFreshness(false, lastSuccessMs);
                 setSharedStatus("FPL updated", 0x38D39F);
-                Serial.printf("FPL GW points: %d\n", gwPoints);
+                Serial.printf("FPL GW points: %d\n", snapshot.gwPoints);
             } else {
-                const bool stale = (lastSuccessMs == 0) || ((now - lastSuccessMs) > 300000U);
+                pollDelayMs = FPL_POLL_INTERVAL_MS;
+                // Idle polls are minutes apart, so "stale" is measured against the interval we expected.
+                const bool stale = (lastSuccessMs == 0) || ((now - lastSuccessMs) > lastSuccessPollDelayMs + 300000U);
                 setSharedFreshness(stale, lastSuccessMs);
                 setSharedStatus("FPL fetch failed", 0xFF5A5A);
             }
@@ -3851,6 +4225,7 @@ void setup() {
     uiRuntimeMutex = xSemaphoreCreateMutex();
     demoMutex = xSemaphoreCreateMutex();
     scriptedDemoMutex = xSemaphoreCreateMutex();
+    fplDataMutex = xSemaphoreCreateMutex();
     if (!sharedUiMutex) {
         Serial.println("Failed to create UI state mutex");
         while (true) {
@@ -3875,6 +4250,13 @@ void setup() {
             delay(1000);
         }
     }
+    if (!fplDataMutex) {
+        Serial.println("Failed to create FPL data mutex");
+        while (true) {
+            delay(1000);
+        }
+    }
+    configureFplHttp();
     setSharedStatus("Booting...", 0xA0A0A0);
     setSharedGwStateText("GW live: ? | next: --");
     setSharedGameweekContext(false, 0, 0, false, 0, false);
