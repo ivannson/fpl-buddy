@@ -12,7 +12,9 @@
 #include <miniz.h>
 #include <time.h>
 #include <cstring>
+#include <new>
 
+#include "display_settings.h"
 #include "fpl_config.h"
 #include "led_ring.h"
 #include "wifi_config.h"
@@ -96,9 +98,16 @@ struct UiRuntimeState {
     uint32_t squadVersion = 0;
 };
 
+// mbedTLS can only allocate from internal RAM, and a TLS handshake needs ~40 KB of it. Large long-lived buffers
+// therefore live in PSRAM (allocated in setup()) rather than as statics, which are placed in internal RAM.
+template <typename T> static T *psramNew() {
+    void *mem = heap_caps_calloc(1, sizeof(T), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return mem ? new (mem) T() : nullptr;
+}
+
 static SemaphoreHandle_t uiRuntimeMutex = nullptr;
 static UiRuntimeState uiRuntimeState;
-static uint8_t kitImageBuffer[kKitRgb565Bytes];
+static uint8_t *kitImageBuffer = nullptr;  // PSRAM, kKitRgb565Bytes
 static lv_image_dsc_t kitImageDsc;
 
 struct UiWidgets {
@@ -109,6 +118,17 @@ struct UiWidgets {
     lv_obj_t *screenPopup = nullptr;
     lv_obj_t *screenEvents = nullptr;
     lv_obj_t *screenSquad = nullptr;
+
+    // Between-gameweeks carousel: screenIdle is the rank page, these are the others. Each body is a
+    // full-screen, non-clickable container rebuilt when its data changes (taps fall through to the screen).
+    lv_obj_t *screenIdleGraph = nullptr;
+    lv_obj_t *screenIdlePrices = nullptr;
+    lv_obj_t *screenIdleWatch = nullptr;
+    lv_obj_t *screenIdleLeagues = nullptr;
+    lv_obj_t *idleGraphBody = nullptr;
+    lv_obj_t *idlePricesBody = nullptr;
+    lv_obj_t *idleWatchBody = nullptr;
+    lv_obj_t *idleLeaguesBody = nullptr;
 
     // Idle
     lv_obj_t *idleRankArrow = nullptr;
@@ -333,6 +353,7 @@ static void processSerialInput();
 // ---------------------------------------------------------------------------
 static constexpr const char *kFplApiBase = "https://fantasy.premierleague.com/api/";
 static constexpr size_t kSmallJsonMaxBytes = 256UL * 1024UL;
+static constexpr time_t kMinValidEpoch = 1700000000;  // earlier means the clock is not synced yet
 
 static WiFiClientSecure fplTlsClient;
 static HTTPClient fplHttp;
@@ -772,11 +793,47 @@ static bool getJsonDocumentFromPsramUrl(const String &url, DynamicJsonDocument &
 // ---------------------------------------------------------------------------
 // Endpoint fetchers
 // ---------------------------------------------------------------------------
+static constexpr size_t kMaxMiniLeagues = 24;
+static constexpr size_t kMaxGameweeks = 38;
+
+struct MiniLeague {
+    int id = 0;
+    char name[40] = "";
+    int rank = 0;
+    int lastRank = 0;  // rank at the end of the previous gameweek; 0 if new
+    int size = 0;
+};
+
 struct EntrySummary {
     int currentGw = 0;
     int overallRank = 0;
     int overallPoints = 0;
     int previousOverallRank = 0;
+    MiniLeague leagues[kMaxMiniLeagues];  // private classic leagues, in API order
+    size_t leagueCount = 0;
+};
+
+struct RankHistory {
+    int gw[kMaxGameweeks] = {};
+    int overallRank[kMaxGameweeks] = {};
+    size_t count = 0;
+};
+
+struct PlayerPrice {
+    int elementId = 0;
+    char name[24] = "";
+    int nowCost = 0;       // tenths of a million
+    int projectedPct = 0;  // tenths of a percent toward the next price update; + rise, - fall
+    bool locked = false;   // price can't change at the next update
+};
+
+struct PriceData {
+    bool hasNextUpdate = false;
+    time_t nextUpdateUtc = 0;
+    PlayerPrice squad[16];
+    size_t squadCount = 0;
+    PlayerPrice watch[kMaxWatchlist];  // in watchlist order; entries that matched no player are left out
+    size_t watchCount = 0;
 };
 
 struct FixtureWindow {
@@ -786,15 +843,20 @@ struct FixtureWindow {
 };
 
 static bool fetchEntrySummary(EntrySummary &out) {
-    DynamicJsonDocument filter(384);
+    DynamicJsonDocument filter(512);
     filter["current_event"] = true;
     filter["summary_overall_rank"] = true;
     filter["summary_overall_points"] = true;
     JsonObject leagueFilter = filter["leagues"]["classic"].createNestedObject();
+    leagueFilter["id"] = true;
+    leagueFilter["name"] = true;
     leagueFilter["short_name"] = true;
+    leagueFilter["league_type"] = true;
+    leagueFilter["entry_rank"] = true;
     leagueFilter["entry_last_rank"] = true;
+    leagueFilter["rank_count"] = true;
 
-    DynamicJsonDocument doc(8192);
+    DynamicJsonDocument doc(16384);
     String url = kFplApiBase;
     url += "entry/";
     url += String(FPL_ENTRY_ID);
@@ -815,12 +877,55 @@ static bool fetchEntrySummary(EntrySummary &out) {
 
     // The system "overall" league carries last gameweek's overall rank, which replaces entry/{id}/history/.
     out.previousOverallRank = 0;
+    out.leagueCount = 0;
     for (JsonObject league : doc["leagues"]["classic"].as<JsonArray>()) {
         const char *shortName = league["short_name"] | "";
         if (strcmp(shortName, "overall") == 0) {
             out.previousOverallRank = league["entry_last_rank"] | 0;
-            break;
         }
+        // "x" = private (invitational) league; "s" are system leagues (overall, country, club...).
+        const char *leagueType = league["league_type"] | "";
+        if (strcmp(leagueType, "x") == 0 && out.leagueCount < kMaxMiniLeagues) {
+            MiniLeague &ml = out.leagues[out.leagueCount++];
+            ml.id = league["id"] | 0;
+            sanitizeUtf8ToAscii(league["name"] | "", ml.name, sizeof(ml.name));
+            ml.rank = league["entry_rank"] | 0;
+            ml.lastRank = league["entry_last_rank"] | 0;
+            ml.size = league["rank_count"] | 0;
+        }
+    }
+    return true;
+}
+
+static bool fetchRankHistory(RankHistory &out) {
+    DynamicJsonDocument filter(128);
+    JsonObject eventFilter = filter["current"].createNestedObject();
+    eventFilter["event"] = true;
+    eventFilter["overall_rank"] = true;
+
+    DynamicJsonDocument doc(4096);
+    String url = kFplApiBase;
+    url += "entry/";
+    url += String(FPL_ENTRY_ID);
+    url += "/history/";
+
+    if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
+        return false;
+    }
+    JsonArray current = doc["current"].as<JsonArray>();
+    if (current.isNull()) {
+        Serial.println("history response missing current");
+        return false;
+    }
+    out.count = 0;
+    for (JsonObject e : current) {
+        const int rank = e["overall_rank"] | 0;
+        if (rank <= 0 || out.count >= kMaxGameweeks) {
+            continue;
+        }
+        out.gw[out.count] = e["event"] | 0;
+        out.overallRank[out.count] = rank;
+        ++out.count;
     }
     return true;
 }
@@ -1070,10 +1175,49 @@ struct PlayerMeta {
     char teamShortName[24] = "";
 };
 
-// One bootstrap-static download for the gameweek flags/deadline and, when metaOut is given, the names,
-// positions and kit slugs of the squad's players.
+// "49.6" or 49.6 -> 496 (tenths). The price fields in bootstrap-static are sent as strings.
+static int jsonTenths(JsonVariantConst v) {
+    const float value = v.is<const char *>() ? static_cast<float>(atof(v.as<const char *>())) : v.as<float>();
+    return static_cast<int>(value * 10.0f + (value >= 0 ? 0.5f : -0.5f));
+}
+
+static bool isAllDigits(const char *text) {
+    if (!text || !*text) {
+        return false;
+    }
+    for (; *text; ++text) {
+        if (*text < '0' || *text > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Watchlist entries match an element ID, or a web name case-insensitively with accents folded ("odegaard").
+static bool watchEntryMatches(const char *entry, int elementId, const char *asciiWebName) {
+    if (isAllDigits(entry)) {
+        return atoi(entry) == elementId;
+    }
+    return strcasecmp(entry, asciiWebName) == 0;
+}
+
+static void fillPlayerPrice(JsonObject e, const char *asciiWebName, time_t nowUtc, PlayerPrice &out) {
+    out = PlayerPrice{};
+    out.elementId = e["id"] | 0;
+    strlcpy(out.name, asciiWebName, sizeof(out.name));
+    out.nowCost = e["now_cost"] | 0;
+    out.projectedPct = jsonTenths(e["price_change_projections"][0]["projected_percent"]);
+    const char *lockedUntil = e["price_change_locked_until"] | nullptr;
+    if (lockedUntil) {
+        time_t lockedUtc = 0;
+        out.locked = !parseIsoUtcToEpoch(lockedUntil, lockedUtc) || nowUtc < kMinValidEpoch || lockedUtc > nowUtc;
+    }
+}
+
+// One bootstrap-static download for the gameweek flags/deadline, price projections for the squad and the
+// watchlist and, when metaOut is given, the names, positions and kit slugs of the squad's players.
 static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_t pickCount, PlayerMeta *metaOut,
-                           size_t &metaCountOut) {
+                           size_t &metaCountOut, const DisplaySettings &settings, PriceData &pricesOut) {
     const bool wantMeta = metaOut != nullptr;
 
     DynamicJsonDocument filter(1536);
@@ -1084,10 +1228,14 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
     eventFilter["finished"] = true;
     eventFilter["deadline_time"] = true;
     eventFilter["deadline_time_epoch"] = true;
+    filter["game_config"]["settings"]["price_change_deadlines"] = true;
+    JsonObject elementFilter = filter["elements"].createNestedObject();
+    elementFilter["id"] = true;
+    elementFilter["web_name"] = true;
+    elementFilter["now_cost"] = true;
+    elementFilter["price_change_locked_until"] = true;
+    elementFilter["price_change_projections"][0]["projected_percent"] = true;
     if (wantMeta) {
-        JsonObject elementFilter = filter["elements"].createNestedObject();
-        elementFilter["id"] = true;
-        elementFilter["web_name"] = true;
         elementFilter["element_type"] = true;
         elementFilter["team"] = true;
         JsonObject typeFilter = filter["element_types"].createNestedObject();
@@ -1098,7 +1246,7 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
         teamFilter["name"] = true;
     }
 
-    DynamicJsonDocument doc(wantMeta ? 110000 : 8192);
+    DynamicJsonDocument doc(FPL_BOOTSTRAP_JSON_DOC_CAPACITY);
     String url = kFplApiBase;
     url += "bootstrap-static/";
     if (!getJsonDocumentFromPsramUrl(url, doc, FPL_BOOTSTRAP_PSRAM_MAX_BYTES, &filter)) {
@@ -1148,6 +1296,47 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
     // Proxy for live state from bootstrap event flags.
     state.isLiveGw = foundCurrent && !currentFinished;
     stateOut = state;
+
+    // Price updates happen at fixed times (currently 23:00 UTC nightly); take the first one still ahead.
+    const time_t nowUtc = time(nullptr);
+    PriceData prices;
+    for (JsonVariantConst d : doc["game_config"]["settings"]["price_change_deadlines"].as<JsonArrayConst>()) {
+        time_t t = 0;
+        if (parseIsoUtcToEpoch(d | nullptr, t) && (nowUtc < kMinValidEpoch || t > nowUtc)) {
+            prices.nextUpdateUtc = t;
+            prices.hasNextUpdate = true;
+            break;
+        }
+    }
+
+    bool watchFound[kMaxWatchlist] = {};
+    PlayerPrice watchSlots[kMaxWatchlist];
+    for (JsonObject e : doc["elements"].as<JsonArray>()) {
+        const int id = e["id"] | 0;
+        char asciiName[24];
+        sanitizeUtf8ToAscii(e["web_name"] | "", asciiName, sizeof(asciiName));
+        for (size_t i = 0; i < pickCount; ++i) {
+            if (picks[i].elementId == id && prices.squadCount < 16) {
+                fillPlayerPrice(e, asciiName, nowUtc, prices.squad[prices.squadCount++]);
+                break;
+            }
+        }
+        for (size_t i = 0; i < settings.watchCount; ++i) {
+            if (!watchFound[i] && watchEntryMatches(settings.watchlist[i], id, asciiName)) {
+                fillPlayerPrice(e, asciiName, nowUtc, watchSlots[i]);
+                watchFound[i] = true;
+            }
+        }
+    }
+    for (size_t i = 0; i < settings.watchCount; ++i) {
+        if (watchFound[i]) {
+            prices.watch[prices.watchCount++] = watchSlots[i];
+        } else {
+            Serial.printf("[WATCH] no player matches '%s' (use the web name shown on the FPL site, or the ID)\n",
+                          settings.watchlist[i]);
+        }
+    }
+    pricesOut = prices;
 
     if (!wantMeta) {
         return true;
@@ -1839,21 +2028,24 @@ static int computeGwPointsFromPicks(const TeamPick *picks, size_t pickCount) {
 // ---------------------------------------------------------------------------
 // Poll cache + scheduling
 // Each endpoint is refetched only when its data can have changed (intervals in fpl_config.h):
-//   entry/{id}/              every poll (current GW, total points, overall rank and last rank)
+//   entry/{id}/              every poll (current GW, total points, overall rank and last rank, mini leagues)
 //   entry/{id}/event/picks/  new GW or every FPL_PICKS_REFRESH_MS (auto-subs change multipliers)
-//   bootstrap-static/        first poll, GW change, deadline passed, unknown players, or FPL_BOOTSTRAP_REFRESH_MS
+//   bootstrap-static/        first poll, GW change, deadline passed, unknown players, price update passed,
+//                            watchlist changed, or FPL_BOOTSTRAP_REFRESH_MS
 //   fixtures/?event={gw}     new GW or every FPL_FIXTURES_REFRESH_MS
 //   event/{gw}/live/         while a match is in play, when a fixture is newly finished, or FPL_LIVE_IDLE_REFRESH_MS
+//   entry/{id}/history/      new GW or every FPL_HISTORY_REFRESH_MS (rank graph)
 // Polls run every FPL_POLL_INTERVAL_MS while a match is in play, otherwise every FPL_IDLE_POLL_INTERVAL_MS
 // (woken early for the next kickoff or deadline).
 // ---------------------------------------------------------------------------
 static constexpr size_t kMaxFixtures = 24;
-static constexpr time_t kMinValidEpoch = 1700000000;
 // A fixture counts as in play from kickoff until FPL marks it finished; capped in case it was abandoned.
 static constexpr time_t kFixtureInPlayMaxSec = 6 * 3600;
 // bootstrap-static is served with Cache-Control: max-age=300, so refetching sooner returns the same copy.
 static constexpr uint32_t kBootstrapMinSpacingMs = 5UL * 60UL * 1000UL;
 static constexpr time_t kPostDeadlineWakeSec = 60;
+// Prices are recalculated at each price update time; refetch bootstrap once this long after it.
+static constexpr time_t kPriceUpdateSettleSec = 10 * 60;
 
 struct FplDataCache {
     bool hasEntry = false;
@@ -1866,6 +2058,9 @@ struct FplDataCache {
     PlayerMeta meta[16];
     size_t metaCount = 0;
     bool hasPlayerMeta = false;
+    bool hasPrices = false;
+    PriceData prices;
+    uint32_t pricesWatchlistVersion = 0;  // DisplaySettings::watchlistVersion the prices were parsed with
 
     int picksGw = 0;
     uint32_t picksFetchedMs = 0;
@@ -1881,8 +2076,12 @@ struct FplDataCache {
     int liveGw = 0;
     uint32_t liveFetchedMs = 0;
     size_t liveFinishedFixtures = 0;
+
+    int historyGw = 0;
+    uint32_t historyFetchedMs = 0;
+    RankHistory history;
 };
-static FplDataCache fplCache;  // guarded by fplDataMutex
+static FplDataCache *fplCache = nullptr;  // PSRAM; guarded by fplDataMutex
 
 struct FplPollResult {
     bool liveFetched = false;
@@ -1960,6 +2159,9 @@ static uint32_t computeNextPollDelayMs(const FplDataCache &c, bool matchInPlay, 
     if (c.hasGwState && c.gwState.hasDeadline) {
         wakeAt(c.gwState.deadlineUtc + kPostDeadlineWakeSec);
     }
+    if (c.hasPrices && c.prices.hasNextUpdate) {
+        wakeAt(c.prices.nextUpdateUtc + kPriceUpdateSettleSec);
+    }
 
     if (delayMs < FPL_POLL_INTERVAL_MS) {
         delayMs = FPL_POLL_INTERVAL_MS;
@@ -1971,14 +2173,13 @@ static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
     const time_t nowUtc = time(nullptr);
     const bool clockValid = nowUtc >= kMinValidEpoch;
 
-    // 1) entry/{id}/ every poll.
-    EntrySummary entry;
-    if (!fetchEntrySummary(entry)) {
+    // 1) entry/{id}/ every poll (also carries mini-league ranks).
+    // The fetchers below only write their output after a successful parse, so they fill the cache directly.
+    if (!fetchEntrySummary(c.entry)) {
         return false;
     }
-    c.entry = entry;
     c.hasEntry = true;
-    const int gw = entry.currentGw;
+    const int gw = c.entry.currentGw;
 
     // 2) picks: change at the deadline and when auto-subs are applied.
     bool squadChanged = false;
@@ -2011,19 +2212,27 @@ static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
     needMeta = !c.hasPlayerMeta;
 #endif
     const bool gwMismatch = c.hasGwState && c.gwState.currentGw != gw;
-    if (!c.hasGwState || elapsedAtLeast(c.bootstrapFetchedMs, FPL_BOOTSTRAP_REFRESH_MS) ||
-        ((needMeta || gwMismatch || deadlinePassed) && elapsedAtLeast(c.bootstrapFetchedMs, kBootstrapMinSpacingMs))) {
+    const bool pricesUpdated = c.hasPrices && c.prices.hasNextUpdate && clockValid &&
+                               nowUtc >= c.prices.nextUpdateUtc + kPriceUpdateSettleSec;
+    static DisplaySettings settings;  // static: keeps it off the task stack
+    displaySettingsGet(settings);
+    const bool watchlistChanged = c.pricesWatchlistVersion != settings.watchlistVersion;
+    if (!c.hasGwState || watchlistChanged || elapsedAtLeast(c.bootstrapFetchedMs, FPL_BOOTSTRAP_REFRESH_MS) ||
+        ((needMeta || gwMismatch || deadlinePassed || pricesUpdated) &&
+         elapsedAtLeast(c.bootstrapFetchedMs, kBootstrapMinSpacingMs))) {
         GameweekState state;
         size_t metaCount = 0;
         PlayerMeta *metaOut = nullptr;
 #if FPL_ENABLE_NAME_LOOKUP
         metaOut = c.meta;
 #endif
-        if (fetchBootstrap(state, c.picks, c.pickCount, metaOut, metaCount)) {
+        if (fetchBootstrap(state, c.picks, c.pickCount, metaOut, metaCount, settings, c.prices)) {
             c.gwState = state;
             c.hasGwState = true;
             c.bootstrapFetchedMs = millis();
             c.bootstrapFetchedUtc = clockValid ? nowUtc : 0;
+            c.hasPrices = true;
+            c.pricesWatchlistVersion = settings.watchlistVersion;
 #if FPL_ENABLE_NAME_LOOKUP
             c.metaCount = metaCount;
             c.hasPlayerMeta = applyPlayerMeta(c.picks, c.pickCount, c.meta, c.metaCount);
@@ -2071,6 +2280,14 @@ static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
         }
     }
 
+    // 6) entry/{id}/history/ for the rank graph: final ranks only change after a GW, so hourly is enough.
+    if (c.historyGw != gw || elapsedAtLeast(c.historyFetchedMs, FPL_HISTORY_REFRESH_MS)) {
+        if (fetchRankHistory(c.history)) {
+            c.historyGw = gw;
+            c.historyFetchedMs = millis();
+        }
+    }
+
     result.nextPollDelayMs = computeNextPollDelayMs(c, matchInPlay, clockValid, nowUtc);
     return true;
 }
@@ -2081,16 +2298,18 @@ static bool refreshFplData(FplPollResult &result) {
     fplHttpStats = FplHttpStats{};
     const uint32_t startMs = millis();
 
-    const bool ok = refreshFplDataSteps(fplCache, result);
+    const bool ok = refreshFplDataSteps(*fplCache, result);
     closeFplConnection();
 
     Serial.printf("[FPL poll] %s in %lu ms | %u requests, %u TLS handshakes, %u B wire, %u B json | "
-                  "match in play: %s | next poll in %lu s\n",
+                  "match in play: %s | next poll in %lu s | internal heap free %u, largest %u\n",
                   ok ? "ok" : "FAILED", static_cast<unsigned long>(millis() - startMs),
                   static_cast<unsigned>(fplHttpStats.requests), static_cast<unsigned>(fplHttpStats.tlsHandshakes),
                   static_cast<unsigned>(fplHttpStats.wireBytes), static_cast<unsigned>(fplHttpStats.jsonBytes),
                   result.matchInPlay ? "yes" : "no",
-                  static_cast<unsigned long>((ok ? result.nextPollDelayMs : FPL_POLL_INTERVAL_MS) / 1000UL));
+                  static_cast<unsigned long>((ok ? result.nextPollDelayMs : FPL_POLL_INTERVAL_MS) / 1000UL),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
     return ok;
 }
 
@@ -2115,6 +2334,64 @@ static void fillSnapshotFromCache(const FplDataCache &c, TeamSnapshot &out) {
     out.gwPoints = computeGwPointsFromPicks(out.picks, out.pickCount);
 }
 
+// Data for the between-gameweeks screens. fplTask publishes it after each successful poll; uiTask copies it
+// when `version` changes.
+struct IdleScreensData {
+    bool hasHistory = false;
+    RankHistory history;
+    bool hasPrices = false;
+    PriceData prices;
+    bool hasLeagues = false;
+    MiniLeague leagues[kMaxMiniLeagues];
+    size_t leagueCount = 0;
+    uint32_t version = 0;
+};
+static IdleScreensData *idleScreensData = nullptr;  // PSRAM
+static SemaphoreHandle_t idleScreensMutex = nullptr;
+// Set by serial commands that need fresh data (e.g. a watchlist change); fplTask polls on its next loop.
+static volatile bool fplPollRequested = false;
+
+static void publishIdleScreensFromCache(const FplDataCache &c) {
+    if (!idleScreensMutex || xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    IdleScreensData &d = *idleScreensData;
+    d.hasHistory = c.historyGw > 0;
+    d.history = c.history;
+    d.hasPrices = c.hasPrices;
+    d.prices = c.prices;
+    // Prices were parsed for the squad at the last bootstrap fetch; drop players transferred out since.
+    d.prices.squadCount = 0;
+    for (size_t i = 0; i < c.prices.squadCount; ++i) {
+        for (size_t j = 0; j < c.pickCount; ++j) {
+            if (c.picks[j].elementId == c.prices.squad[i].elementId) {
+                d.prices.squad[d.prices.squadCount++] = c.prices.squad[i];
+                break;
+            }
+        }
+    }
+    d.hasLeagues = c.hasEntry;
+    d.leagueCount = c.entry.leagueCount;
+    for (size_t i = 0; i < c.entry.leagueCount; ++i) {
+        d.leagues[i] = c.entry.leagues[i];
+    }
+    d.version++;
+    xSemaphoreGive(idleScreensMutex);
+}
+
+// Copies the shared data if its version differs from knownVersion.
+static bool copyIdleScreensDataIfChanged(IdleScreensData &out, uint32_t knownVersion) {
+    if (!idleScreensMutex || xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return false;
+    }
+    const bool changed = idleScreensData->version != knownVersion;
+    if (changed) {
+        out = *idleScreensData;
+    }
+    xSemaphoreGive(idleScreensMutex);
+    return changed;
+}
+
 // Used by `demo seed`: runs a normal cache-aware refresh and copies the result.
 static bool fetchTeamSnapshot(TeamSnapshot &out) {
     if (!fplDataMutex || xSemaphoreTake(fplDataMutex, pdMS_TO_TICKS(120000)) != pdTRUE) {
@@ -2123,7 +2400,8 @@ static bool fetchTeamSnapshot(TeamSnapshot &out) {
     FplPollResult result;
     const bool ok = refreshFplData(result);
     if (ok) {
-        fillSnapshotFromCache(fplCache, out);
+        fillSnapshotFromCache(*fplCache, out);
+        publishIdleScreensFromCache(*fplCache);
     }
     xSemaphoreGive(fplDataMutex);
     return ok;
@@ -2259,9 +2537,26 @@ static bool holdTriggered = false;
 static uint32_t renderedEventsVersion = 0;
 static uint32_t renderedSquadVersion = 0;
 
+enum class IdlePage : uint8_t { Rank = 0, RankGraph, Prices, Watchlist, Leagues };
+static constexpr uint8_t kIdlePageCount = 5;
+static IdlePage idlePage = IdlePage::Rank;
+static size_t idleLeaguePage = 0;  // the leagues screen pages through leagues before moving on
+static uint32_t idlePageShownMs = 0;
+
+static lv_obj_t *idlePageScreen(IdlePage page) {
+    switch (page) {
+        case IdlePage::Rank: return ui.screenIdle;
+        case IdlePage::RankGraph: return ui.screenIdleGraph;
+        case IdlePage::Prices: return ui.screenIdlePrices;
+        case IdlePage::Watchlist: return ui.screenIdleWatch;
+        case IdlePage::Leagues: return ui.screenIdleLeagues;
+    }
+    return ui.screenIdle;
+}
+
 static lv_obj_t *modeToScreen(UiMode mode) {
     switch (mode) {
-        case UiMode::Idle: return ui.screenIdle;
+        case UiMode::Idle: return idlePageScreen(idlePage);
         case UiMode::Deadline: return ui.screenDeadline;
         case UiMode::FinalHour: return ui.screenFinalHour;
         case UiMode::Live: return ui.screenLive;
@@ -2275,6 +2570,12 @@ static lv_obj_t *modeToScreen(UiMode mode) {
 static void loadMode(UiMode mode, lv_screen_load_anim_t anim) {
     if (currentMode == mode) {
         return;
+    }
+    if (mode == UiMode::Idle) {
+        // Entering the between-gameweeks carousel always starts on the rank page.
+        idlePage = IdlePage::Rank;
+        idleLeaguePage = 0;
+        idlePageShownMs = millis();
     }
     lv_obj_t *target = modeToScreen(mode);
     if (!target) {
@@ -2550,6 +2851,518 @@ static void refreshSquadList(const UiRuntimeState &runtime) {
     lv_obj_center(demoBtn3Label);
 }
 
+// ---------------------------------------------------------------------------
+// Between-gameweeks carousel
+// Rank -> rank graph -> squad price changes -> watchlist -> mini leagues, every screenIntervalSec or on tap.
+// Pages with nothing to show are skipped (the rank page is always shown).
+// ---------------------------------------------------------------------------
+static constexpr size_t kLeaguesPerPage = 5;
+static constexpr size_t kPriceRowsMax = 6;
+static constexpr int kIdleRowW = 300;
+
+static IdleScreensData *idleUiData = nullptr;      // PSRAM; uiTask's copy
+static IdleScreensData *serialIdleData = nullptr;  // PSRAM; serial commands' copy
+static DisplaySettings idleUiSettings;
+static uint32_t idleUiDataVersion = 0;
+static uint32_t idleUiSettingsVersion = 0;
+
+// 950 -> "950", 56,800 -> "57k", 1,234,567 -> "1.2M".
+static void formatRankCompact(int rank, char *out, size_t outLen) {
+    if (rank < 10000) {
+        formatNumberWithCommas(rank, out, outLen);
+    } else if (rank < 1000000) {
+        snprintf(out, outLen, "%dk", (rank + 500) / 1000);
+    } else {
+        snprintf(out, outLen, "%.1fM", rank / 1000000.0);
+    }
+}
+
+static void formatPrice(int tenths, char *out, size_t outLen) {
+    snprintf(out, outLen, "%d.%dm", tenths / 10, tenths % 10);
+}
+
+// +1 rise, -1 fall, 0 no change expected at the next price update.
+static int expectedPriceDirection(const PlayerPrice &p) {
+    const int threshold = FPL_PRICE_CHANGE_THRESHOLD_PCT * 10;
+    if (p.locked) {
+        return 0;
+    }
+    if (p.projectedPct >= threshold) {
+        return 1;
+    }
+    if (p.projectedPct <= -threshold) {
+        return -1;
+    }
+    return 0;
+}
+
+static size_t visibleLeagues(const MiniLeague **out, size_t capacity) {
+    size_t n = 0;
+    if (!idleUiData->hasLeagues) {
+        return 0;
+    }
+    for (size_t i = 0; i < idleUiData->leagueCount && n < capacity; ++i) {
+        if (!displaySettingsIsLeagueHidden(idleUiSettings, idleUiData->leagues[i].id)) {
+            out[n++] = &idleUiData->leagues[i];
+        }
+    }
+    return n;
+}
+
+static size_t leaguePageCount() {
+    const MiniLeague *leagues[kMaxMiniLeagues];
+    const size_t n = visibleLeagues(leagues, kMaxMiniLeagues);
+    return (n + kLeaguesPerPage - 1) / kLeaguesPerPage;
+}
+
+// Index range of the history entries shown on the graph (last N gameweeks, or all).
+static size_t rankGraphFirstIndex() {
+    const size_t count = idleUiData->history.count;
+    const size_t wanted = idleUiSettings.rankGraphGameweeks;
+    return (wanted == 0 || wanted >= count) ? 0 : count - wanted;
+}
+
+static bool idlePageAvailable(IdlePage page) {
+    switch (page) {
+        case IdlePage::Rank:
+            return true;
+        case IdlePage::RankGraph:
+            return idleUiData->hasHistory && idleUiData->history.count - rankGraphFirstIndex() >= 2;
+        case IdlePage::Prices:
+            return idleUiData->hasPrices;
+        case IdlePage::Watchlist:
+            return idleUiSettings.watchCount > 0 && idleUiData->hasPrices && idleUiData->prices.watchCount > 0;
+        case IdlePage::Leagues:
+            return leaguePageCount() > 0;
+    }
+    return false;
+}
+
+static void idleTapEventCb(lv_event_t *);
+
+static lv_obj_t *createIdleCarouselScreen(lv_obj_t *&bodyOut) {
+    lv_obj_t *screen = lv_obj_create(nullptr);
+    styleScreen(screen, kColorBgDeep);
+    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(screen, idleTapEventCb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *body = lv_obj_create(screen);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_size(body, kDisplayWidth, kDisplayHeight);
+    lv_obj_set_pos(body, 0, 0);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+    bodyOut = body;
+    return screen;
+}
+
+static void createIdleTitle(lv_obj_t *body, const char *title, const char *subtitle) {
+    lv_obj_t *titleLabel = createLabel(body, kFontCaption, kColorAccentCyan, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(titleLabel, title);
+    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 46);
+    if (subtitle && subtitle[0]) {
+        lv_obj_t *subtitleLabel = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+        lv_label_set_text(subtitleLabel, subtitle);
+        lv_obj_align(subtitleLabel, LV_ALIGN_TOP_MID, 0, 72);
+    }
+}
+
+// A transparent row centred horizontally at vertical offset `yOffset` from the screen centre.
+static lv_obj_t *createIdleRow(lv_obj_t *body, int yOffset, int height) {
+    lv_obj_t *row = lv_obj_create(body);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, kIdleRowW, height);
+    lv_obj_align(row, LV_ALIGN_CENTER, 0, yOffset);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
+    return row;
+}
+
+static lv_obj_t *createRowLabel(lv_obj_t *row, const lv_font_t *font, uint32_t colorHex, lv_align_t align, int xOfs,
+                                int width, const char *text) {
+    const lv_text_align_t textAlign = align == LV_ALIGN_RIGHT_MID ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT;
+    lv_obj_t *label = createLabel(row, font, colorHex, textAlign);
+    if (width > 0) {
+        lv_obj_set_width(label, width);
+        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
+    }
+    lv_label_set_text(label, text);
+    lv_obj_align(label, align, xOfs, 0);
+    return label;
+}
+
+static void createIdleMessage(lv_obj_t *body, const char *text) {
+    lv_obj_t *label = createLabel(body, kFontBody, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+    lv_obj_set_width(label, 280);
+    lv_label_set_text(label, text);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+}
+
+// Row centres for `rows` rows of `rowH`, laid out around a point slightly below the screen centre.
+static int idleRowY(size_t index, size_t rows, int rowH) {
+    const int blockH = static_cast<int>(rows) * rowH;
+    return 10 - blockH / 2 + rowH / 2 + static_cast<int>(index) * rowH;
+}
+
+static void formatNextPriceUpdate(char *out, size_t outLen) {
+    out[0] = '\0';
+    if (!idleUiData->prices.hasNextUpdate || time(nullptr) < kMinValidEpoch) {
+        return;
+    }
+    const time_t t = idleUiData->prices.nextUpdateUtc;
+    struct tm local;
+    localtime_r(&t, &local);
+    snprintf(out, outLen, "next update %02d:%02d", local.tm_hour, local.tm_min);
+}
+
+static void renderRankGraphPage() {
+    lv_obj_t *body = ui.idleGraphBody;
+    if (!body) {
+        return;
+    }
+    lv_obj_clean(body);
+    const RankHistory &h = idleUiData->history;
+    const size_t first = rankGraphFirstIndex();
+    const size_t n = h.count > first ? h.count - first : 0;
+
+    char subtitle[32];
+    if (idleUiSettings.rankGraphGameweeks == 0) {
+        strlcpy(subtitle, "all gameweeks", sizeof(subtitle));
+    } else {
+        snprintf(subtitle, sizeof(subtitle), "last %u gameweeks", static_cast<unsigned>(n));
+    }
+    createIdleTitle(body, "RANK HISTORY", subtitle);
+    if (n < 2) {
+        createIdleMessage(body, "Not enough gameweeks yet");
+        return;
+    }
+
+    // Y axis: best (lowest) rank at the top, 10% margin on both ends.
+    int best = h.overallRank[first];
+    int worst = h.overallRank[first];
+    for (size_t i = first; i < h.count; ++i) {
+        best = h.overallRank[i] < best ? h.overallRank[i] : best;
+        worst = h.overallRank[i] > worst ? h.overallRank[i] : worst;
+    }
+    int axisTop = static_cast<int>(best * 0.9);
+    if (axisTop < 1) {
+        axisTop = 1;
+    }
+    const int axisBottom = static_cast<int>(static_cast<int64_t>(worst) * 11 / 10 + 1);
+    const int64_t span = axisBottom - axisTop;
+
+    static constexpr int kChartX = 100;
+    static constexpr int kChartY = 118;
+    static constexpr int kChartW = 256;
+    static constexpr int kChartH = 160;
+    static constexpr int kChartPad = 6;  // room for the end points
+    // lv_chart maps values in int32 (value * height), so plot on a 0..10000 scale instead of raw ranks.
+    static constexpr int32_t kScale = 10000;
+
+    lv_obj_t *chart = lv_chart_create(body);
+    lv_obj_set_size(chart, kChartW, kChartH);
+    lv_obj_set_pos(chart, kChartX, kChartY);
+    lv_obj_remove_flag(chart, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(chart, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_opa(chart, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(chart, kChartPad, LV_PART_MAIN);
+    lv_obj_set_style_line_color(chart, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
+    lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
+    lv_obj_set_style_line_width(chart, 3, LV_PART_ITEMS);
+    lv_obj_set_style_width(chart, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_height(chart, 8, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(chart, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_div_line_count(chart, 3, 0);
+    lv_chart_set_point_count(chart, static_cast<uint32_t>(n));
+    lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, kScale);
+    lv_chart_series_t *series = lv_chart_add_series(chart, lv_color_hex(kColorAccentCyan), LV_CHART_AXIS_PRIMARY_Y);
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t fromBottom = axisBottom - h.overallRank[first + i];
+        lv_chart_set_value_by_id(chart, series, static_cast<uint32_t>(i), static_cast<int32_t>(fromBottom * kScale / span));
+    }
+    lv_chart_refresh(chart);
+
+    // Y labels at the three division lines.
+    const int contentH = kChartH - 2 * kChartPad;
+    const int axisValues[3] = {axisTop, axisTop + static_cast<int>(span / 2), axisBottom};
+    char buf[24];
+    for (int i = 0; i < 3; ++i) {
+        formatRankCompact(axisValues[i], buf, sizeof(buf));
+        lv_obj_t *label = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_width(label, 56);
+        lv_label_set_text(label, buf);
+        lv_obj_set_pos(label, kChartX - 60, kChartY + kChartPad + (contentH * i) / 2 - 8);
+    }
+
+    // X labels: every GW when they fit, otherwise first, middle and last.
+    const int contentW = kChartW - 2 * kChartPad;
+    const bool labelAll = n <= 10;
+    for (size_t i = 0; i < n; ++i) {
+        if (!labelAll && i != 0 && i != n - 1 && i != (n - 1) / 2) {
+            continue;
+        }
+        snprintf(buf, sizeof(buf), n <= 5 || !labelAll ? "GW%d" : "%d", h.gw[first + i]);
+        lv_obj_t *label = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+        lv_obj_set_width(label, 44);
+        lv_label_set_text(label, buf);
+        const int x = kChartX + kChartPad + static_cast<int>((contentW * static_cast<int>(i)) / static_cast<int>(n - 1));
+        lv_obj_set_pos(label, x - 22, kChartY + kChartH + 4);
+    }
+
+    // Latest rank with the change from the previous gameweek on the graph.
+    const int latest = h.overallRank[h.count - 1];
+    const int previous = h.overallRank[h.count - 2];
+    char rankBuf[24];
+    formatNumberWithCommas(latest, rankBuf, sizeof(rankBuf));
+    snprintf(buf, sizeof(buf), "GW%d  %s", h.gw[h.count - 1], rankBuf);
+    lv_obj_t *footer = createLabel(body, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(footer, buf);
+    lv_obj_align(footer, LV_ALIGN_CENTER, -10, 118);
+    lv_obj_t *arrow = createLabel(body, kFontBody,
+                                  latest < previous ? kColorAccentGreen :
+                                  (latest > previous ? kColorAccentRed : kColorTextSecondary),
+                                  LV_TEXT_ALIGN_LEFT);
+    lv_label_set_text(arrow, latest < previous ? LV_SYMBOL_UP : (latest > previous ? LV_SYMBOL_DOWN : "-"));
+    lv_obj_align_to(arrow, footer, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+}
+
+static void renderPricesPage() {
+    lv_obj_t *body = ui.idlePricesBody;
+    if (!body) {
+        return;
+    }
+    lv_obj_clean(body);
+    char subtitle[40];
+    char nextUpdate[24];
+    formatNextPriceUpdate(nextUpdate, sizeof(nextUpdate));
+    snprintf(subtitle, sizeof(subtitle), "my squad%s%s", nextUpdate[0] ? " - " : "", nextUpdate);
+    createIdleTitle(body, "PRICE CHANGES", subtitle);
+
+    const PriceData &prices = idleUiData->prices;
+    const PlayerPrice *changes[16];
+    size_t changeCount = 0;
+    for (size_t i = 0; i < prices.squadCount; ++i) {
+        if (expectedPriceDirection(prices.squad[i]) != 0) {
+            changes[changeCount++] = &prices.squad[i];
+        }
+    }
+    if (changeCount == 0) {
+        createIdleMessage(body, "No expected\nprice changes");
+        return;
+    }
+    // Rises first, then falls; strongest projection first within each.
+    for (size_t i = 1; i < changeCount; ++i) {
+        for (size_t j = i; j > 0; --j) {
+            const PlayerPrice *a = changes[j - 1];
+            const PlayerPrice *b = changes[j];
+            if (b->projectedPct > a->projectedPct) {
+                changes[j - 1] = b;
+                changes[j] = a;
+            }
+        }
+    }
+
+    static constexpr int kRowH = 38;
+    const size_t shown = changeCount > kPriceRowsMax ? kPriceRowsMax - 1 : changeCount;
+    const size_t rows = changeCount > kPriceRowsMax ? kPriceRowsMax : changeCount;
+    char buf[32];
+    for (size_t i = 0; i < shown; ++i) {
+        const PlayerPrice &p = *changes[i];
+        const int dir = expectedPriceDirection(p);
+        lv_obj_t *row = createIdleRow(body, idleRowY(i, rows, kRowH), kRowH);
+        createRowLabel(row, kFontBody, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 170, p.name);
+        char priceBuf[12];
+        formatPrice(p.nowCost, priceBuf, sizeof(priceBuf));
+        snprintf(buf, sizeof(buf), "%s %s", priceBuf, dir > 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
+        createRowLabel(row, kFontBody, dir > 0 ? kColorAccentGreen : kColorAccentRed, LV_ALIGN_RIGHT_MID, -8, 0, buf);
+    }
+    if (shown < changeCount) {
+        lv_obj_t *row = createIdleRow(body, idleRowY(shown, rows, kRowH), kRowH);
+        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
+        snprintf(buf, sizeof(buf), "+%u more", static_cast<unsigned>(changeCount - shown));
+        lv_obj_t *more = createLabel(row, kFontCaption, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+        lv_label_set_text(more, buf);
+        lv_obj_center(more);
+    }
+}
+
+static void renderWatchlistPage() {
+    lv_obj_t *body = ui.idleWatchBody;
+    if (!body) {
+        return;
+    }
+    lv_obj_clean(body);
+    char nextUpdate[24];
+    formatNextPriceUpdate(nextUpdate, sizeof(nextUpdate));
+    createIdleTitle(body, "WATCHLIST", nextUpdate);
+
+    const PriceData &prices = idleUiData->prices;
+    const size_t rows = prices.watchCount;
+    const int rowH = rows > 6 ? 28 : 38;
+    const lv_font_t *nameFont = rows > 6 ? &lv_font_montserrat_16 : kFontCaption;
+    char buf[32];
+    for (size_t i = 0; i < rows; ++i) {
+        const PlayerPrice &p = prices.watch[i];
+        const int dir = expectedPriceDirection(p);
+        lv_obj_t *row = createIdleRow(body, idleRowY(i, rows, rowH), rowH);
+        createRowLabel(row, nameFont, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 118, p.name);
+
+        // Price and progress toward the next change, e.g. "9.5m +50%".
+        char priceBuf[12];
+        formatPrice(p.nowCost, priceBuf, sizeof(priceBuf));
+        snprintf(buf, sizeof(buf), "%s %+d%%", priceBuf, p.projectedPct / 10);
+        createRowLabel(row, kFontMicro, kColorTextSecondary, LV_ALIGN_LEFT_MID, 132, 0, buf);
+
+        uint32_t color = kColorTextSecondary;
+        const char *status = "No change";
+        if (p.locked) {
+            status = "Locked";
+        } else if (dir > 0) {
+            status = LV_SYMBOL_UP " Rise";
+            color = kColorAccentGreen;
+        } else if (dir < 0) {
+            status = LV_SYMBOL_DOWN " Fall";
+            color = kColorAccentRed;
+        }
+        createRowLabel(row, &lv_font_montserrat_16, color, LV_ALIGN_RIGHT_MID, -8, 0, status);
+    }
+}
+
+static void renderLeaguesPage() {
+    lv_obj_t *body = ui.idleLeaguesBody;
+    if (!body) {
+        return;
+    }
+    lv_obj_clean(body);
+    const MiniLeague *leagues[kMaxMiniLeagues];
+    const size_t total = visibleLeagues(leagues, kMaxMiniLeagues);
+    const size_t pages = (total + kLeaguesPerPage - 1) / kLeaguesPerPage;
+    if (idleLeaguePage >= pages) {
+        idleLeaguePage = 0;
+    }
+
+    char subtitle[24] = "";
+    if (pages > 1) {
+        snprintf(subtitle, sizeof(subtitle), "%u / %u", static_cast<unsigned>(idleLeaguePage + 1),
+                 static_cast<unsigned>(pages));
+    }
+    createIdleTitle(body, "MINI LEAGUES", subtitle);
+    if (total == 0) {
+        createIdleMessage(body, "No mini leagues");
+        return;
+    }
+
+    static constexpr int kRowH = 42;
+    const size_t first = idleLeaguePage * kLeaguesPerPage;
+    const size_t rows = (total - first) < kLeaguesPerPage ? (total - first) : kLeaguesPerPage;
+    char buf[24];
+    for (size_t i = 0; i < rows; ++i) {
+        const MiniLeague &lg = *leagues[first + i];
+        lv_obj_t *row = createIdleRow(body, idleRowY(i, kLeaguesPerPage, kRowH), kRowH);
+        createRowLabel(row, kFontCaption, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 160, lg.name);
+
+        char rankBuf[16];
+        formatNumberWithCommas(lg.rank, rankBuf, sizeof(rankBuf));
+        snprintf(buf, sizeof(buf), "#%s", rankBuf);
+        createRowLabel(row, kFontCaption, kColorTextPrimary, LV_ALIGN_RIGHT_MID, -70, 0, buf);
+
+        // Movement since the end of the previous gameweek (positive = climbed).
+        const int moved = lg.lastRank > 0 ? lg.lastRank - lg.rank : 0;
+        uint32_t color = kColorTextSecondary;
+        if (moved > 0) {
+            snprintf(buf, sizeof(buf), LV_SYMBOL_UP "%d", moved);
+            color = kColorAccentGreen;
+        } else if (moved < 0) {
+            snprintf(buf, sizeof(buf), LV_SYMBOL_DOWN "%d", -moved);
+            color = kColorAccentRed;
+        } else {
+            strlcpy(buf, "-", sizeof(buf));
+        }
+        lv_obj_t *move = createRowLabel(row, &lv_font_montserrat_16, color, LV_ALIGN_RIGHT_MID, -8, 60, buf);
+        lv_obj_set_style_text_align(move, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    }
+}
+
+static void renderIdlePage(IdlePage page) {
+    switch (page) {
+        case IdlePage::Rank: break;  // updated continuously by updateModeUi
+        case IdlePage::RankGraph: renderRankGraphPage(); break;
+        case IdlePage::Prices: renderPricesPage(); break;
+        case IdlePage::Watchlist: renderWatchlistPage(); break;
+        case IdlePage::Leagues: renderLeaguesPage(); break;
+    }
+}
+
+static void showIdlePage(IdlePage page) {
+    idlePage = page;
+    idlePageShownMs = millis();
+    renderIdlePage(page);
+    lv_obj_t *screen = idlePageScreen(page);
+    if (currentMode == UiMode::Idle && screen && lv_screen_active() != screen) {
+        lv_screen_load_anim(screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+    }
+}
+
+static void advanceIdlePage() {
+    if (idlePage == IdlePage::Leagues && idleLeaguePage + 1 < leaguePageCount()) {
+        ++idleLeaguePage;
+        idlePageShownMs = millis();
+        renderLeaguesPage();
+        return;
+    }
+    IdlePage next = idlePage;
+    for (uint8_t i = 0; i < kIdlePageCount; ++i) {
+        next = static_cast<IdlePage>((static_cast<uint8_t>(next) + 1) % kIdlePageCount);
+        if (idlePageAvailable(next)) {
+            break;
+        }
+    }
+    idleLeaguePage = 0;
+    showIdlePage(next);
+}
+
+static void idleTapEventCb(lv_event_t *) {
+    if (currentMode == UiMode::Idle) {
+        advanceIdlePage();
+    }
+}
+
+// Called from uiTask every loop: picks up new data/settings and advances the carousel on its timer.
+static void serviceIdleCarousel() {
+    bool changed = false;
+    if (copyIdleScreensDataIfChanged(*idleUiData, idleUiDataVersion)) {
+        idleUiDataVersion = idleUiData->version;
+        changed = true;
+    }
+    const uint32_t settingsVersion = displaySettingsVersion();
+    if (settingsVersion != 0 && settingsVersion != idleUiSettingsVersion) {
+        displaySettingsGet(idleUiSettings);
+        idleUiSettingsVersion = settingsVersion;
+        changed = true;
+    }
+
+    if (currentMode != UiMode::Idle) {
+        return;
+    }
+    if (!idlePageAvailable(idlePage)) {
+        advanceIdlePage();
+        return;
+    }
+    if (changed) {
+        renderIdlePage(idlePage);
+    }
+    const uint32_t intervalMs = static_cast<uint32_t>(idleUiSettings.screenIntervalSec) * 1000U;
+    if (intervalMs > 0 && millis() - idlePageShownMs >= intervalMs) {
+        advanceIdlePage();
+    }
+}
+
 static void backFromEventsCb(lv_event_t *) {
     loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_MOVE_RIGHT);
 }
@@ -2710,6 +3523,12 @@ static void createUi(void) {
     lv_obj_align(ui.idleTotalPoints, LV_ALIGN_CENTER, 0, 78);
     ui.statusLabel = createLabel(ui.screenIdle, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
     lv_obj_align(ui.statusLabel, LV_ALIGN_BOTTOM_MID, 0, -22);
+    lv_obj_add_event_cb(ui.screenIdle, idleTapEventCb, LV_EVENT_CLICKED, nullptr);
+
+    ui.screenIdleGraph = createIdleCarouselScreen(ui.idleGraphBody);
+    ui.screenIdlePrices = createIdleCarouselScreen(ui.idlePricesBody);
+    ui.screenIdleWatch = createIdleCarouselScreen(ui.idleWatchBody);
+    ui.screenIdleLeagues = createIdleCarouselScreen(ui.idleLeaguesBody);
 
     ui.deadlineLabel = createLabel(ui.screenDeadline, &lv_font_montserrat_28, kColorAccentAmber, LV_TEXT_ALIGN_CENTER);
     lv_label_set_text(ui.deadlineLabel, "DEADLINE");
@@ -3556,6 +4375,187 @@ static void printDemoHelp() {
     Serial.println();
 }
 
+static void printDisplayHelp() {
+    Serial.println("\nBetween-gameweeks screens (saved to flash):");
+    Serial.println("  screens                       show current settings");
+    Serial.println("  screens interval <seconds>    time per screen, 5-600");
+    Serial.println("  screens graph <3|5|10|all>    gameweeks on the rank graph");
+    Serial.println("  screens reset                 restore fpl_config.h defaults");
+    Serial.println("  watch                         list watched players and their price status");
+    Serial.println("  watch add <web name|id>       e.g. `watch add saka`, `watch add b.fernandes`");
+    Serial.println("  watch remove <web name|id> | watch clear");
+    Serial.println("  league                        list mini leagues (shown/hidden)");
+    Serial.println("  league hide <id> | league show <id> | league show all");
+    Serial.println();
+}
+
+static void printDisplaySettings() {
+    static DisplaySettings settings;  // static: keeps it off the loop task stack
+    displaySettingsGet(settings);
+    Serial.printf("[SCREENS] interval %us | rank graph %s", settings.screenIntervalSec,
+                  settings.rankGraphGameweeks == 0 ? "all GWs" : "");
+    if (settings.rankGraphGameweeks != 0) {
+        Serial.printf("last %u GWs", settings.rankGraphGameweeks);
+    }
+    Serial.printf(" | %u watched | %u hidden leagues\n", static_cast<unsigned>(settings.watchCount),
+                  static_cast<unsigned>(settings.hiddenLeagueCount));
+}
+
+static void printWatchlist() {
+    static DisplaySettings settings;
+    IdleScreensData &data = *serialIdleData;
+    displaySettingsGet(settings);
+    copyIdleScreensDataIfChanged(data, 0);
+    if (settings.watchCount == 0) {
+        Serial.println("[WATCH] watchlist is empty (screen skipped). Add with `watch add <web name|id>`");
+        return;
+    }
+    Serial.printf("[WATCH] %u watched:\n", static_cast<unsigned>(settings.watchCount));
+    for (size_t i = 0; i < settings.watchCount; ++i) {
+        const PlayerPrice *match = nullptr;
+        for (size_t j = 0; j < data.prices.watchCount && !match; ++j) {
+            if (watchEntryMatches(settings.watchlist[i], data.prices.watch[j].elementId, data.prices.watch[j].name)) {
+                match = &data.prices.watch[j];
+            }
+        }
+        if (!match) {
+            Serial.printf("  %-20s (no data yet, or no player with this name)\n", settings.watchlist[i]);
+            continue;
+        }
+        const int dir = expectedPriceDirection(*match);
+        Serial.printf("  %-20s id %-4d %d.%dm  progress %+.1f%%  %s\n", match->name, match->elementId,
+                      match->nowCost / 10, match->nowCost % 10, match->projectedPct / 10.0,
+                      match->locked ? "locked" : (dir > 0 ? "RISE expected" : (dir < 0 ? "FALL expected" : "no change")));
+    }
+}
+
+static void printLeagues() {
+    static DisplaySettings settings;
+    IdleScreensData &data = *serialIdleData;
+    displaySettingsGet(settings);
+    copyIdleScreensDataIfChanged(data, 0);
+    if (!data.hasLeagues) {
+        Serial.println("[LEAGUE] no data yet (waiting for the first FPL poll)");
+        return;
+    }
+    if (data.leagueCount == 0) {
+        Serial.println("[LEAGUE] not in any mini leagues (screen skipped)");
+        return;
+    }
+    for (size_t i = 0; i < data.leagueCount; ++i) {
+        const MiniLeague &lg = data.leagues[i];
+        Serial.printf("  %-6s %8d  %-32s rank %d/%d (last %d)\n",
+                      displaySettingsIsLeagueHidden(settings, lg.id) ? "hidden" : "shown", lg.id, lg.name, lg.rank,
+                      lg.size, lg.lastRank);
+    }
+}
+
+// Joins tokens[from..count) with single spaces, for names like "mac allister".
+static void joinTokens(char **tokens, size_t from, size_t count, char *out, size_t outLen) {
+    out[0] = '\0';
+    for (size_t i = from; i < count; ++i) {
+        if (i > from) {
+            strlcat(out, " ", outLen);
+        }
+        strlcat(out, tokens[i], outLen);
+    }
+}
+
+// Returns true if the line was a display settings command.
+static bool handleDisplayCommand(char **tokens, size_t tokenCount) {
+    if (strcmp(tokens[0], "screens") == 0) {
+        if (tokenCount == 1) {
+            printDisplaySettings();
+        } else if (strcmp(tokens[1], "help") == 0) {
+            printDisplayHelp();
+        } else if (strcmp(tokens[1], "interval") == 0 && tokenCount >= 3) {
+            int seconds = 0;
+            if (!parseIntToken(tokens[2], seconds) || !displaySettingsSetScreenInterval(static_cast<uint16_t>(seconds))) {
+                Serial.println("[SCREENS] interval must be 5-600 seconds");
+                return true;
+            }
+            printDisplaySettings();
+        } else if (strcmp(tokens[1], "graph") == 0 && tokenCount >= 3) {
+            int gameweeks = 0;
+            if (strcmp(tokens[2], "all") != 0 && !parseIntToken(tokens[2], gameweeks)) {
+                gameweeks = -1;
+            }
+            if (gameweeks < 0 || gameweeks > 255 || !displaySettingsSetRankGraphGameweeks(static_cast<uint8_t>(gameweeks))) {
+                Serial.println("[SCREENS] graph expects 3, 5, 10 or all");
+                return true;
+            }
+            printDisplaySettings();
+        } else if (strcmp(tokens[1], "reset") == 0) {
+            displaySettingsReset();
+            fplPollRequested = true;
+            printDisplaySettings();
+        } else {
+            printDisplayHelp();
+        }
+        return true;
+    }
+
+    if (strcmp(tokens[0], "watch") == 0) {
+        if (tokenCount == 1 || strcmp(tokens[1], "list") == 0) {
+            printWatchlist();
+            return true;
+        }
+        char entry[kWatchEntryLen];
+        joinTokens(tokens, 2, tokenCount, entry, sizeof(entry));
+        if (strcmp(tokens[1], "add") == 0 && entry[0]) {
+            switch (displaySettingsWatchAdd(entry)) {
+                case WatchlistResult::Ok:
+                    Serial.printf("[WATCH] added '%s', fetching prices...\n", entry);
+                    fplPollRequested = true;
+                    break;
+                case WatchlistResult::Full: Serial.printf("[WATCH] watchlist full (%u max)\n", static_cast<unsigned>(kMaxWatchlist)); break;
+                case WatchlistResult::Duplicate: Serial.println("[WATCH] already watched"); break;
+                default: Serial.println("[WATCH] invalid name"); break;
+            }
+        } else if (strcmp(tokens[1], "remove") == 0 && entry[0]) {
+            if (displaySettingsWatchRemove(entry) == WatchlistResult::Ok) {
+                Serial.printf("[WATCH] removed '%s'\n", entry);
+                fplPollRequested = true;
+            } else {
+                Serial.println("[WATCH] not in watchlist (use the name exactly as `watch` lists it)");
+            }
+        } else if (strcmp(tokens[1], "clear") == 0) {
+            displaySettingsWatchClear();
+            fplPollRequested = true;
+            Serial.println("[WATCH] cleared, watchlist screen will be skipped");
+        } else {
+            printDisplayHelp();
+        }
+        return true;
+    }
+
+    if (strcmp(tokens[0], "league") == 0 || strcmp(tokens[0], "leagues") == 0) {
+        if (tokenCount == 1 || strcmp(tokens[1], "list") == 0) {
+            printLeagues();
+            return true;
+        }
+        const bool hide = strcmp(tokens[1], "hide") == 0;
+        const bool show = strcmp(tokens[1], "show") == 0;
+        if ((hide || show) && tokenCount >= 3) {
+            if (show && strcmp(tokens[2], "all") == 0) {
+                displaySettingsShowAllLeagues();
+                Serial.println("[LEAGUE] all mini leagues shown");
+                return true;
+            }
+            int id = 0;
+            if (!parseIntToken(tokens[2], id) || !displaySettingsSetLeagueHidden(id, hide)) {
+                Serial.println("[LEAGUE] expects a league ID from `league` (hidden list holds 32 max)");
+                return true;
+            }
+            Serial.printf("[LEAGUE] %d %s\n", id, hide ? "hidden" : "shown");
+            return true;
+        }
+        printDisplayHelp();
+        return true;
+    }
+    return false;
+}
+
 static void handleSerialCommandLine(char *line) {
     if (!line) {
         return;
@@ -3572,6 +4572,10 @@ static void handleSerialCommandLine(char *line) {
 
     if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
         printDemoHelp();
+        printDisplayHelp();
+        return;
+    }
+    if (handleDisplayCommand(tokens, tokenCount)) {
         return;
     }
 
@@ -4127,6 +5131,7 @@ static void uiTask(void *) {
             snapshotUiRuntime(localRuntime);
             updateModeUi(localState, localRuntime);
             serviceScriptedDemo();
+            serviceIdleCarousel();
 
             UiMode autoMode = determineAutoMode(localState);
             if (currentMode != UiMode::EventsList && currentMode != UiMode::Squad && currentMode != UiMode::EventPopup) {
@@ -4196,7 +5201,8 @@ static void fplTask(void *) {
             continue;
         }
 
-        if (lastPollMs == 0 || now - lastPollMs >= pollDelayMs) {
+        if (lastPollMs == 0 || now - lastPollMs >= pollDelayMs || fplPollRequested) {
+            fplPollRequested = false;
             lastPollMs = now;
             setSharedStatus("Fetching FPL points...", 0xFFCC66);
 
@@ -4205,7 +5211,8 @@ static void fplTask(void *) {
             if (xSemaphoreTake(fplDataMutex, portMAX_DELAY) == pdTRUE) {
                 ok = refreshFplData(result);
                 if (ok) {
-                    fillSnapshotFromCache(fplCache, snapshot);
+                    fillSnapshotFromCache(*fplCache, snapshot);
+                    publishIdleScreensFromCache(*fplCache);
                 }
                 xSemaphoreGive(fplDataMutex);
             }
@@ -4266,6 +5273,18 @@ static void ledTask(void *) {
 void setup() {
     Serial.begin(115200);
     delay(500);
+
+    kitImageBuffer = static_cast<uint8_t *>(heap_caps_calloc(1, kKitRgb565Bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    fplCache = psramNew<FplDataCache>();
+    idleScreensData = psramNew<IdleScreensData>();
+    idleUiData = psramNew<IdleScreensData>();
+    serialIdleData = psramNew<IdleScreensData>();
+    if (!kitImageBuffer || !fplCache || !idleScreensData || !idleUiData || !serialIdleData) {
+        Serial.println("PSRAM allocation failed");
+        while (true) {
+            delay(1000);
+        }
+    }
 
     Serial.println("\\n=== Waveshare ESP32-S3-Touch-LCD-1.46B: FPL Buddy ===");
     ledRingInit();
@@ -4330,6 +5349,8 @@ void setup() {
     demoMutex = xSemaphoreCreateMutex();
     scriptedDemoMutex = xSemaphoreCreateMutex();
     fplDataMutex = xSemaphoreCreateMutex();
+    idleScreensMutex = xSemaphoreCreateMutex();
+    displaySettingsInit();
     if (!sharedUiMutex) {
         Serial.println("Failed to create UI state mutex");
         while (true) {
@@ -4354,7 +5375,7 @@ void setup() {
             delay(1000);
         }
     }
-    if (!fplDataMutex) {
+    if (!fplDataMutex || !idleScreensMutex) {
         Serial.println("Failed to create FPL data mutex");
         while (true) {
             delay(1000);
@@ -4387,6 +5408,10 @@ void setup() {
         }
     }
     Serial.println("Worker tasks started");
+    Serial.printf("Internal heap free %u, largest %u | PSRAM free %u\n",
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     Serial.println("Type `demo help` in serial monitor for manual demo controls");
 }
 

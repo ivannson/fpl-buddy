@@ -37,6 +37,38 @@
 #define FPL_LIVE_IDLE_REFRESH_MS (30UL * 60UL * 1000UL)
 #endif
 
+// Max age of `entry/{id}/history/` (overall rank per gameweek, for the rank graph).
+#ifndef FPL_HISTORY_REFRESH_MS
+#define FPL_HISTORY_REFRESH_MS (60UL * 60UL * 1000UL)
+#endif
+
+// --- Between-gameweeks screens ---------------------------------------------------------------------------
+// While no gameweek is live, the display cycles through: rank, rank graph, squad price changes, watchlist,
+// mini leagues. Tap to skip ahead. These are first-boot defaults: change them over serial (`screens help`,
+// `watch ...`, `league ...`); changes are saved to flash and override these values.
+
+// Seconds per screen (5-600).
+#ifndef FPL_IDLE_SCREEN_INTERVAL_SEC
+#define FPL_IDLE_SCREEN_INTERVAL_SEC 30
+#endif
+
+// Gameweeks on the rank graph: 3, 5, 10, or 0 for all.
+#ifndef FPL_RANK_GRAPH_GAMEWEEKS
+#define FPL_RANK_GRAPH_GAMEWEEKS 5
+#endif
+
+// Watched players for price changes: comma-separated web names (as on the FPL site) or element IDs.
+// Up to 8. Empty string = no watchlist screen.
+#ifndef FPL_DEFAULT_WATCHLIST
+#define FPL_DEFAULT_WATCHLIST "Saka"
+#endif
+
+// A price change is expected when the projected progress for the next price update
+// (`price_change_projections[0].projected_percent`) reaches +/- this value.
+#ifndef FPL_PRICE_CHANGE_THRESHOLD_PCT
+#define FPL_PRICE_CHANGE_THRESHOLD_PCT 100
+#endif
+
 // `bootstrap-static` is large and can be unreliable on-device.
 // Keep disabled for stable polling; enable only when name lookup is needed.
 #ifndef FPL_ENABLE_NAME_LOOKUP
@@ -46,6 +78,12 @@
 // Upper bound for /bootstrap-static payload stored in PSRAM before parsing.
 #ifndef FPL_BOOTSTRAP_PSRAM_MAX_BYTES
 #define FPL_BOOTSTRAP_PSRAM_MAX_BYTES (3UL * 1024UL * 1024UL)
+#endif
+
+// ArduinoJson document capacity for the filtered /bootstrap-static (all players with name, team and price
+// projections is ~200 KB).
+#ifndef FPL_BOOTSTRAP_JSON_DOC_CAPACITY
+#define FPL_BOOTSTRAP_JSON_DOC_CAPACITY 320000UL
 #endif
 
 // Upper bound for /event/{gw}/live/ payload stored in PSRAM before parsing.

@@ -9,12 +9,15 @@ FPL Buddy now targets the **Waveshare ESP32-S3-Touch-LCD-1.46** platform.
 
 This is **v1** of the project.
 
-- The current code works, but it still needs optimization (for example, avoiding frequent fetches of the large `bootstrap-static` endpoint).
-- Planned feature ideas for screens that cycle between game weeks:
-  - mini-league rank
-  - price changes
-  - predicted price changes
+- FPL polling is cached and adaptive (gzip, one TLS connection per poll, `bootstrap-static` only when needed).
+- Screens that cycle between gameweeks: rank history graph, predicted price changes for the squad and a watchlist, mini-league ranks.
 - CAD files and full assembly instructions will be published shortly.
+
+### To do
+
+- Fix the layout of the between-gameweeks screens so text isn't cut off at the edges of the round display.
+- Smoother animations when switching between screens.
+- Confirm the price change rule (projected progress reaching ±100%) against real price changes (`api_test/price_changes.py`).
 
 ## Hardware Migration Note
 
@@ -31,6 +34,20 @@ The project was migrated from Sunton ESP32-2424S012C (ESP32-C3) to **Waveshare E
 - LVGL UI with animated full-screen arc and central points card.
 - Wi-Fi connection + periodic FPL API polling.
 - On-screen value shows **current gameweek points** (`summary_event_points`).
+- Between gameweeks the display cycles through screens every 30 s, or on tap: overall rank, rank history graph, predicted squad price changes, watchlist price changes, and mini-league ranks. Screens with nothing to show are skipped.
+
+### Screen settings (serial monitor)
+
+Defaults are in `include/fpl_config.h` (`FPL_IDLE_SCREEN_INTERVAL_SEC`, `FPL_RANK_GRAPH_GAMEWEEKS`, `FPL_DEFAULT_WATCHLIST`). Changes made over serial are saved to flash:
+
+```text
+screens interval 20          # seconds per screen (5-600)
+screens graph all            # rank graph range: 3, 5, 10 or all
+watch add saka               # watch a player by web name or ID (up to 8)
+watch remove saka | watch clear
+league                       # list mini leagues with their IDs
+league hide 98809 | league show all
+```
 
 ## Configuration
 
