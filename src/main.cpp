@@ -357,6 +357,8 @@ static void configureFplHttp() {
     // HTTPClient ignores addHeader("Accept-Encoding", ...); it must be set here.
     fplHttp.setAcceptEncoding("gzip, identity");
     fplHttp.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    static const char *kHeaderKeys[] = {"Transfer-Encoding"};
+    fplHttp.collectHeaders(kHeaderKeys, 1);
 }
 
 static void closeFplConnection() {
@@ -364,7 +366,7 @@ static void closeFplConnection() {
     fplTlsClient.stop();
 }
 
-// Growable, NUL-terminated PSRAM buffer that HTTPClient::writeToStream() can fill (handles chunked bodies).
+// Growable, NUL-terminated PSRAM buffer for response bodies.
 class PsramBufferSink : public Stream {
 public:
     explicit PsramBufferSink(size_t maxBytes) : maxBytes_(maxBytes) {}
@@ -454,6 +456,94 @@ private:
     size_t maxBytes_;
     bool overflowed_ = false;
 };
+
+// Body readers. HTTPClient::writeToStream() is not used: while waiting for TLS data it loops with delay(0)
+// (NetworkClientSecure::read returns -1 when nothing is buffered), which never lets IDLE0 run, so a slow
+// download on core 0 trips the 5 s task watchdog. These wait with delay(1) instead.
+static bool readBodyBytes(NetworkClient &client, PsramBufferSink &sink, size_t len, uint32_t timeoutMs) {
+    uint8_t chunk[1024];
+    uint32_t lastDataMs = millis();
+    while (len > 0) {
+        const int avail = client.available();
+        if (avail <= 0) {
+            if (!client.connected() || millis() - lastDataMs >= timeoutMs) {
+                return false;
+            }
+            delay(1);
+            continue;
+        }
+        size_t want = static_cast<size_t>(avail);
+        if (want > sizeof(chunk)) {
+            want = sizeof(chunk);
+        }
+        if (want > len) {
+            want = len;
+        }
+        const int got = client.read(chunk, want);
+        if (got <= 0) {
+            delay(1);
+            continue;
+        }
+        if (sink.write(chunk, static_cast<size_t>(got)) != static_cast<size_t>(got)) {
+            return false;
+        }
+        len -= static_cast<size_t>(got);
+        lastDataMs = millis();
+    }
+    return true;
+}
+
+static bool readBodyLine(NetworkClient &client, char *line, size_t lineLen, uint32_t timeoutMs) {
+    size_t n = 0;
+    uint32_t lastDataMs = millis();
+    for (;;) {
+        if (client.available() <= 0) {
+            if (!client.connected() || millis() - lastDataMs >= timeoutMs) {
+                return false;
+            }
+            delay(1);
+            continue;
+        }
+        const int c = client.read();
+        if (c < 0) {
+            delay(1);
+            continue;
+        }
+        lastDataMs = millis();
+        if (c == '\n') {
+            if (n > 0 && line[n - 1] == '\r') {
+                --n;
+            }
+            line[n] = '\0';
+            return true;
+        }
+        if (n + 1 < lineLen) {
+            line[n++] = static_cast<char>(c);
+        }
+    }
+}
+
+static bool readChunkedBody(NetworkClient &client, PsramBufferSink &sink, uint32_t timeoutMs) {
+    char line[64];
+    for (;;) {
+        if (!readBodyLine(client, line, sizeof(line), timeoutMs)) {
+            return false;
+        }
+        const size_t chunkLen = strtoul(line, nullptr, 16);
+        if (chunkLen == 0) {
+            // Skip optional trailers up to the terminating empty line.
+            do {
+                if (!readBodyLine(client, line, sizeof(line), timeoutMs)) {
+                    return false;
+                }
+            } while (line[0] != '\0');
+            return true;
+        }
+        if (!readBodyBytes(client, sink, chunkLen, timeoutMs) || !readBodyLine(client, line, sizeof(line), timeoutMs)) {
+            return false;
+        }
+    }
+}
 
 static bool isGzip(const char *data, size_t len) {
     return len >= 18 && static_cast<uint8_t>(data[0]) == 0x1F && static_cast<uint8_t>(data[1]) == 0x8B;
@@ -584,15 +674,25 @@ static bool fetchUrlToPsramBuffer(const String &url, char *&bufferOut, size_t &l
             return false;
         }
 
-        const int written = fplHttp.writeToStream(&sink);
+        static constexpr uint32_t kBodyTimeoutMs = 30000;
+        NetworkClient *stream = fplHttp.getStreamPtr();
+        bool bodyOk = false;
+        if (stream && contentLen > 0) {
+            bodyOk = readBodyBytes(*stream, sink, static_cast<size_t>(contentLen), kBodyTimeoutMs);
+        } else if (stream && fplHttp.header("Transfer-Encoding").equalsIgnoreCase("chunked")) {
+            bodyOk = readChunkedBody(*stream, sink, kBodyTimeoutMs);
+        } else {
+            Serial.printf("No Content-Length or chunked encoding [%s]\n", url.c_str());
+        }
         fplHttp.end();
         if (sink.overflowed()) {
             Serial.printf("Payload too large [%s] (> %u bytes)\n", url.c_str(), static_cast<unsigned>(maxBytes));
             closeFplConnection();
             return false;
         }
-        if (written <= 0 || sink.length() == 0) {
-            Serial.printf("Body read failed [%s]: %d, attempt %d/2\n", url.c_str(), written, attempt);
+        if (!bodyOk || sink.length() == 0) {
+            Serial.printf("Body read failed [%s]: %u bytes, attempt %d/2\n", url.c_str(),
+                          static_cast<unsigned>(sink.length()), attempt);
             closeFplConnection();
             continue;
         }
@@ -927,6 +1027,9 @@ static void normalizeKitTeamSlug(char *slug, size_t slugLen) {
     static const TeamSlugAlias aliases[] = {
         {"afc_bournemouth", "bournemouth"},
         {"brighton_and_hove_albion", "brighton"},
+        {"coventry_city", "coventry"},
+        {"hull_city", "hull"},
+        {"ipswich_town", "ipswich"},
         {"manchester_city", "man_city"},
         {"manchester_utd", "man_utd"},
         {"manchester_united", "man_utd"},
@@ -934,6 +1037,7 @@ static void normalizeKitTeamSlug(char *slug, size_t slugLen) {
         {"newcastle_united", "newcastle"},
         {"nott_m_forest", "nottingham_forest"},
         {"nottm_forest", "nottingham_forest"},
+        {"spurs", "tottenham"},
         {"tottenham_hotspur", "tottenham"},
         {"west_ham_united", "west_ham"},
         {"wolverhampton_wanderers", "wolves"},
