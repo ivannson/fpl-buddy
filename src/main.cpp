@@ -2624,10 +2624,19 @@ static uint32_t touchReleasedSinceMs = 0;
 static uint8_t touchReleasedReads = 0;
 static uint32_t touchLastPressMs = 0;  // how long the last finished press lasted
 static lv_point_t touchLastPoint = {0, 0};
+// `device touch off`: ignore the touchscreen until restart (for screenshots, or a panel reporting ghost touches).
+static volatile bool touchIgnored = false;
 
 // LVGL gets the same debounced press: getTouch reports "not touched" when polled too soon after the last read or
 // when a controller read fails, and passing that dropout on would make one tap two clicks (two page turns).
 static void lvglTouchCb(lv_indev_t *, lv_indev_data_t *data) {
+    if (touchIgnored) {
+        touchPressStartMs = 0;
+        touchReleasedReads = 0;
+        data->point = touchLastPoint;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     int x = 0;
     int y = 0;
     if (touch.getTouch(&x, &y)) {
@@ -5792,6 +5801,7 @@ static void printDeviceHelp() {
     Serial.println("  device                        WiFi, web UI address, firmware version");
     Serial.println("  device setup                  restart as a WiFi access point for setup");
     Serial.println("  device password clear         remove the web UI password");
+    Serial.println("  device touch [on|off]         off ignores the touchscreen until restart");
     Serial.println("  device restart");
     Serial.println("  device off                    switch off (on battery; USB keeps it running)");
     Serial.println("  device battery [<0-100>|auto] battery voltage; a percentage previews the icon");
@@ -5834,6 +5844,11 @@ static bool handleDeviceCommand(char **tokens, size_t tokenCount) {
     } else if (strcmp(tokens[1], "password") == 0 && tokenCount >= 3 && strcmp(tokens[2], "clear") == 0) {
         deviceConfigSetWebPassword("");
         Serial.println("[DEVICE] web UI password removed");
+    } else if (strcmp(tokens[1], "touch") == 0) {
+        if (tokenCount >= 3) {
+            touchIgnored = strcmp(tokens[2], "off") == 0;
+        }
+        Serial.printf("[DEVICE] touchscreen %s\n", touchIgnored ? "ignored until restart" : "on");
     } else if (strcmp(tokens[1], "restart") == 0) {
         ESP.restart();
     } else if (strcmp(tokens[1], "off") == 0) {
@@ -6329,10 +6344,10 @@ struct DemoSamplePlayer {
     uint8_t elementType;
     uint8_t cost;  // tenths of a million
 };
-// "Start with sample team": 1-3-4-3, captain Haaland (slot 9), vice captain Salah (slot 5).
+// "Start with sample team": 1-3-4-3, captain Haaland (slot 9), vice captain Wirtz (slot 5).
 static const DemoSamplePlayer kDemoSampleSquad[] = {
     {"Raya", "arsenal", 1, 60},         {"Gabriel", "arsenal", 2, 65},     {"Virgil", "liverpool", 2, 60},
-    {"Gvardiol", "man_city", 2, 60},    {"M.Salah", "liverpool", 3, 140},  {"Palmer", "chelsea", 3, 105},
+    {"Gvardiol", "man_city", 2, 60},    {"Wirtz", "liverpool", 3, 85},     {"Palmer", "chelsea", 3, 105},
     {"Saka", "arsenal", 3, 100},        {"B.Fernandes", "man_utd", 3, 90}, {"Haaland", "man_city", 4, 145},
     {"Watkins", "aston_villa", 4, 90},  {"Isak", "liverpool", 4, 105},     {"Pickford", "everton", 1, 55},
     {"Munoz", "crystal_palace", 2, 55}, {"Gordon", "newcastle", 3, 75},    {"Mbeumo", "man_utd", 3, 80},

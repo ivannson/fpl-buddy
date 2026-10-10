@@ -36,25 +36,33 @@ The LED ring's data line goes to **GPIO 13** by default (`FPL_LED_RING_PIN` in `
 
 ### During a live gameweek
 
-The display cycles through:
-
-- **Live score:** your gameweek points and live overall rank.
-- **Points events:** what each player scored from. **Clear** hides old events so only new ones show.
-- **Squad:** each player's live points, with your captain marked and the bench below.
-- **Mini leagues:** live ranks in each of your mini leagues.
-- **Rank graph:** your rank history, ending on your live overall rank.
-
 When one of your players scores, assists, keeps a clean sheet, gets bonus points, a card and so on, a pop-up shows
-the event with the club's kit and the points, and the LED ring flashes purple. Tap the latest-event card on the live
-score to jump to the events list.
+the event with the club's kit and the points, and the LED ring flashes purple. In between, the display cycles through
+the screens below. Tap the latest-event card on the live score to jump to the events list.
+
+| <img src="screenshots/goal-popup.png" width="240" alt="Goal pop-up: Saka in the Arsenal kit, +5 pts"> | <img src="screenshots/live-score.png" width="240" alt="Live score: 44 gameweek points and live rank 93,399"> | <img src="screenshots/live-events.png" width="240" alt="Events list: Gabriel clean sheet, Haaland goal, Palmer assist"> |
+|:---:|:---:|:---:|
+| **Event pop-up**<br>The player's kit and points | **Live score**<br>Gameweek points, live rank and the latest event | **Events**<br>What each player scored from. **Clear** hides old ones. |
+| <img src="screenshots/live-squad.png" width="240" alt="Squad list with each player's live points"> | <img src="screenshots/live-leagues.png" width="240" alt="Live mini-league ranks"> | <img src="screenshots/live-graph.png" width="240" alt="Rank graph over 10 gameweeks ending on the live rank"> |
+| **Squad**<br>Live points, captain and vice-captain, then the bench | **Mini leagues**<br>Your live rank in each league | **Live rank**<br>Rank history ending on your live rank |
 
 ### Between gameweeks
 
 The display cycles through your overall rank, a rank history graph, predicted price changes for your squad, price
 changes for players on your watchlist, and your mini-league ranks. Screens with nothing to show are skipped.
 
+| <img src="screenshots/idle-rank.png" width="240" alt="Overall rank 184,392, up 46,613, with gameweek and total points"> | <img src="screenshots/idle-graph.png" width="240" alt="Rank history graph over the last 10 gameweeks"> | <img src="screenshots/idle-prices.png" width="240" alt="Predicted price changes: Haaland and Wirtz rise, Munoz falls"> |
+|:---:|:---:|:---:|
+| **Overall rank**<br>With gameweek and total points | **Rank history**<br>Last 3, 5, 10 or all gameweeks | **Price changes**<br>Predicted rises and falls in your squad |
+| <img src="screenshots/idle-watchlist.png" width="240" alt="Watchlist: Saka likely rise, Raya no change"> | <img src="screenshots/idle-leagues.png" width="240" alt="Mini-league ranks with movement"> | |
+| **Watchlist**<br>Price changes for players you choose | **Mini leagues**<br>Your rank and how it moved | |
+
 In the last 6 hours before a deadline the display switches to a countdown, and in the final hour to a full-screen
 countdown ring.
+
+| <img src="screenshots/deadline.png" width="240" alt="Deadline countdown: 05:23:38 to Gameweek 13"> | <img src="screenshots/final-hour.png" width="240" alt="Final hour: 38:08 left, with a countdown ring around the edge"> |
+|:---:|:---:|
+| **Deadline**<br>The last 6 hours | **Final hour**<br>The ring around the edge runs down |
 
 ### Touch
 
@@ -99,6 +107,8 @@ The kit images are uploaded separately from the firmware. Without them the event
 shirt. When you only change code, `pio run -t upload` is enough.
 
 ### 2. Connect it to WiFi
+
+<img src="screenshots/setup-mode.png" width="220" align="right" alt="Setup mode screen with a QR code to join the FPL-Buddy WiFi network">
 
 You don't need to put your WiFi details in the firmware. If none are saved, the device starts in **setup mode**: it
 creates a WiFi network called `FPL-Buddy-XXXX` and shows a QR code for it on the display. Scan the code or join the
@@ -190,10 +200,25 @@ device password clear          remove the web UI password
 device restart
 device off                     switch off (on battery; USB keeps it running)
 device battery                 battery voltage and level
+device touch off | on          ignore the touchscreen until the next restart
 ```
 
 For development there are also `demo`, `gw` and `event` commands (a serial version of the Demo tab), `fps`, and
 `screenshot [page]`.
+
+### Screenshots
+
+The screenshots in this README come straight from the display. `scripts/screenshot.py` sends the `screenshot`
+command over USB and saves what's on screen as a round PNG:
+
+```bash
+pip install pillow pyserial
+python scripts/screenshot.py /dev/cu.usbmodem101 out.png          # whatever is on screen
+python scripts/screenshot.py /dev/cu.usbmodem101 graph.png graph  # rank, graph, prices, watch, leagues, events, squad
+```
+
+Use the web UI's [Demo mode](#demo-mode) with the sample team to put each screen up, and `device touch off` so a stray
+touch doesn't change the screen mid-capture.
 
 ## Configuration
 
@@ -250,6 +275,8 @@ names to the names the firmware uses. Add `--preview <folder>` to also save PNG 
 | `boards/` | PlatformIO board definition for the Waveshare board |
 | `data/kits/` | Club kit images, uploaded with `pio run -t uploadfs` |
 | `scripts/convert_kits.py` | Converts kit PNGs for `data/kits/` |
+| `scripts/screenshot.py` | Saves the display as a PNG over USB |
+| `screenshots/`, `photos/` | Images used in this README |
 | `api_test/` | Python scripts that check the FPL API against what the firmware expects (see [api_test/README.md](api_test/README.md)) |
 
 ## Status
