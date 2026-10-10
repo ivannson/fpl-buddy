@@ -6372,7 +6372,7 @@ struct DemoSampleLeague {
     int lastRank;
     int size;
 };
-// Used when the real entry has no mini leagues (or there is no FPL data yet).
+// Used with the sample team, or when the real entry has no mini leagues (or there is no FPL data yet).
 static const DemoSampleLeague kDemoSampleLeagues[] = {
     {"Office League", 3, 5, 14}, {"Family & Friends", 1, 2, 8}, {"Sunday League Lads", 7, 4, 12}, {"Uni Mates", 2, 2, 10},
 };
@@ -6438,7 +6438,7 @@ static int demoPlayerCost(const TeamPick &pick, const IdleScreensData &real) {
 
 // Between-gameweeks screens for the demo: a rank history ending at the demo rank, price changes for the demo
 // squad and the watchlist (a rise, a fall, a hold and a lock, so every state shows), and the real mini leagues
-// (or sample ones). Caller holds demoMutex.
+// (sample ones with the sample team). Caller holds demoMutex.
 static void publishDemoIdleScreensLocked() {
     static DisplaySettings settings;  // guarded by demoMutex
     displaySettingsGet(settings);
@@ -6525,7 +6525,7 @@ static void publishDemoIdleScreensLocked() {
     }
     d.hasPrices = true;
 
-    if (real.hasLeagues && real.leagueCount > 0) {
+    if (s.source == DemoSource::MyTeam && real.hasLeagues && real.leagueCount > 0) {
         d.leagueCount = real.leagueCount;
         for (size_t i = 0; i < real.leagueCount; ++i) {
             d.leagues[i] = real.leagues[i];

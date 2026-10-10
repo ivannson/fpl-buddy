@@ -175,8 +175,8 @@ pauses while the demo runs. **Stop demo**, or restarting the device, brings back
   between-gameweeks tour) that play without you touching anything. Keep the page open while one runs.
 
 The between-gameweeks screens get demo data too: a rank history that ends at the demo rank, and price changes for the
-squad and watchlist that include a rise, a fall, no change and a locked price. Mini leagues are your real ones, or
-sample leagues if you have none.
+squad and watchlist that include a rise, a fall, no change and a locked price. With your own team the mini leagues
+are your real ones. With the sample team, or if you have none, they're sample leagues.
 
 ## Serial commands
 
