@@ -4,7 +4,13 @@ A live Fantasy Premier League tracker for your desk. A 3D-printed Premier League
 an LED ring. It shows your gameweek points, rank and player events as they happen. Between gameweeks it cycles through
 your rank history, price changes and mini leagues.
 
-**▶️ [Watch the full build on YouTube](https://www.youtube.com/watch?v=uSBmQau3X9I)**
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=uSBmQau3X9I">
+    <img src="photos/youtube-thumbnail.jpg" alt="Watch the full build on YouTube" width="100%">
+  </a>
+  <br>
+  <b>▶️ <a href="https://www.youtube.com/watch?v=uSBmQau3X9I">Watch the full build on YouTube</a></b>
+</p>
 
 <p align="center">
   <img src="photos/goal-notification.jpg" alt="FPL Buddy on a desk showing a goal pop-up with the Arsenal kit and +5 pts, the LED ring lit purple" width="49%">
