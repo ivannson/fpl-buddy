@@ -17,6 +17,13 @@ struct LedRingState {
     int rankTrend = 0;  // +1 = rank up, -1 = rank down, 0 = no signal
     bool deadlineCountdownEnabled = false;
     time_t deadlineUtc = 0;
+    bool gameweekLive = false;
+    bool matchInPlay = false;
+    uint8_t rankBrightnessPct = 100;
+    uint8_t deadlineBrightnessPct = 100;
+    uint8_t notificationBrightnessPct = 100;
+    bool rankOnlyLiveGw = false;
+    bool rankOnlyMatchLive = false;
     uint8_t animationMode = kLedRingAnimBreathing;
     uint8_t head = 0;
     uint32_t lastRotateMs = 0;
@@ -80,6 +87,18 @@ static uint8_t safeFlashCycles() {
 
 static bool timeReached(uint32_t nowMs, uint32_t targetMs) {
     return static_cast<int32_t>(nowMs - targetMs) >= 0;
+}
+
+// Scales the hardware cap by pct. Every render rewrites all pixels, so Adafruit's lossy rescale of the old buffer
+// never shows.
+static void applyBrightnessPct(uint8_t pct) {
+    if (pct > 100) {
+        pct = 100;
+    }
+    const uint32_t level = (static_cast<uint32_t>(clampByte(FPL_LED_RING_MAX_BRIGHTNESS)) * pct + 50U) / 100U;
+    if (gRing.getBrightness() != level) {
+        gRing.setBrightness(static_cast<uint8_t>(level));
+    }
 }
 
 static void clearRing() {
@@ -265,6 +284,34 @@ void ledRingSetDeadlineCountdown(bool enabled, time_t deadlineUtc) {
     xSemaphoreGive(gState.mutex);
 }
 
+void ledRingSetLiveState(bool gameweekLive, bool matchInPlay) {
+    if (!gState.initialized || !gState.mutex) {
+        return;
+    }
+    if (xSemaphoreTake(gState.mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return;
+    }
+    gState.gameweekLive = gameweekLive;
+    gState.matchInPlay = matchInPlay;
+    xSemaphoreGive(gState.mutex);
+}
+
+void ledRingApplySettings(uint8_t rankBrightnessPct, uint8_t deadlineBrightnessPct,
+                          uint8_t notificationBrightnessPct, bool rankOnlyLiveGw, bool rankOnlyMatchLive) {
+    if (!gState.initialized || !gState.mutex) {
+        return;
+    }
+    if (xSemaphoreTake(gState.mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
+        return;
+    }
+    gState.rankBrightnessPct = rankBrightnessPct;
+    gState.deadlineBrightnessPct = deadlineBrightnessPct;
+    gState.notificationBrightnessPct = notificationBrightnessPct;
+    gState.rankOnlyLiveGw = rankOnlyLiveGw;
+    gState.rankOnlyMatchLive = rankOnlyMatchLive;
+    xSemaphoreGive(gState.mutex);
+}
+
 void ledRingSetPulsePeriodMs(uint32_t periodMs) {
     if (!gState.initialized || !gState.mutex) {
         return;
@@ -362,13 +409,19 @@ void ledRingTick(uint32_t nowMs) {
     const bool flashWindowActive = gState.flashActive;
     const bool deadlineCountdownEnabled = gState.deadlineCountdownEnabled;
     const time_t deadlineUtc = gState.deadlineUtc;
-    const int rankTrend = gState.rankTrend;
+    const bool rankVisible = (!gState.rankOnlyLiveGw || gState.gameweekLive) &&
+                             (!gState.rankOnlyMatchLive || gState.matchInPlay);
+    const int rankTrend = rankVisible ? gState.rankTrend : 0;
+    const uint8_t rankBrightnessPct = gState.rankBrightnessPct;
+    const uint8_t deadlineBrightnessPct = gState.deadlineBrightnessPct;
+    const uint8_t notificationBrightnessPct = gState.notificationBrightnessPct;
     const uint8_t animationMode = gState.animationMode;
     const uint8_t head = gState.head;
     const uint32_t pulsePeriodMs = normalizePulsePeriodMs(gState.pulsePeriodMs);
     xSemaphoreGive(gState.mutex);
 
     if (flashWindowActive) {
+        applyBrightnessPct(notificationBrightnessPct);
         if (flashOn) {
             renderSolid(kPurpleR, kPurpleG, kPurpleB);
         } else {
@@ -382,12 +435,14 @@ void ledRingTick(uint32_t nowMs) {
         if (nowUtc > 100000 && deadlineUtc > 0) {
             const int64_t secRemaining64 = static_cast<int64_t>(deadlineUtc) - static_cast<int64_t>(nowUtc);
             if (secRemaining64 <= kDeadlineCountdownWindowSec) {
+                applyBrightnessPct(deadlineBrightnessPct);
                 renderDeadlineCountdown(nowMs, static_cast<int32_t>(secRemaining64));
                 return;
             }
         }
     }
 
+    applyBrightnessPct(rankBrightnessPct);
     if (animationMode == kLedRingAnimComet) {
         renderRankTrendComet(nowMs, rankTrend, head, pulsePeriodMs);
         return;
@@ -405,6 +460,8 @@ void ledRingInit() {}
 void ledRingTick(uint32_t) {}
 void ledRingSetRankTrend(int, bool) {}
 void ledRingSetDeadlineCountdown(bool, time_t) {}
+void ledRingSetLiveState(bool, bool) {}
+void ledRingApplySettings(uint8_t, uint8_t, uint8_t, bool, bool) {}
 void ledRingSetPulsePeriodMs(uint32_t) {}
 void ledRingSetAnimationMode(uint8_t) {}
 void ledRingTriggerNotificationForMs(uint32_t) {}

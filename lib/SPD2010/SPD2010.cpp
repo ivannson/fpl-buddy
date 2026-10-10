@@ -100,6 +100,10 @@ bool SPD2010Display::initPanel() {
         return false;
     }
 
+    esp_lcd_panel_io_callbacks_t callbacks = {};
+    callbacks.on_color_trans_done = onColorTransDone;
+    esp_lcd_panel_io_register_event_callbacks(_io, &callbacks, this);
+
     spd2010_vendor_config_t vendor_config = {};
     vendor_config.init_cmds = nullptr;
     vendor_config.init_cmds_size = 0;
@@ -243,6 +247,29 @@ void SPD2010Display::drawBitmap(int x, int y, int w, int h, const uint8_t *data)
             y + row_start + rows,
             draw_buf);
     }
+}
+
+bool SPD2010Display::onColorTransDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t *, void *ctx) {
+    SPD2010Display *self = static_cast<SPD2010Display *>(ctx);
+    if (self && self->_doneCb) {
+        self->_doneCb(self->_doneCtx);
+    }
+    return false;
+}
+
+void SPD2010Display::setTransferDoneCallback(void (*cb)(void *ctx), void *ctx) {
+    _doneCtx = ctx;
+    _doneCb = cb;
+}
+
+bool SPD2010Display::drawBitmapAsync(int x, int y, int w, int h, const void *data) {
+    if (!_initialized || !_panel || !data || w <= 0 || h <= 0 || (x & 0x3) || (w & 0x3)) {
+        return false;
+    }
+    if (x < 0 || y < 0 || (x + w) > SPD2010_WIDTH || (y + h) > SPD2010_HEIGHT) {
+        return false;
+    }
+    return esp_lcd_panel_draw_bitmap(_panel, x, y, x + w, y + h, data) == ESP_OK;
 }
 
 void SPD2010Display::setBacklight(uint8_t brightness) {

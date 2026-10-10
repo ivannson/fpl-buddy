@@ -14,6 +14,11 @@ static constexpr const char *kKeyInterval = "scr_int";
 static constexpr const char *kKeyGraph = "graph_gw";
 static constexpr const char *kKeyWatchlist = "watch";
 static constexpr const char *kKeyHiddenLeagues = "lg_hidden";
+static constexpr const char *kKeyLedRankBright = "led_rank_br";
+static constexpr const char *kKeyLedDeadlineBright = "led_dl_br";
+static constexpr const char *kKeyLedNotifyBright = "led_nt_br";
+static constexpr const char *kKeyLedRankLiveGw = "led_rank_gw";
+static constexpr const char *kKeyLedRankMatch = "led_rank_mt";
 
 static SemaphoreHandle_t settingsMutex = nullptr;
 static DisplaySettings settings;
@@ -24,6 +29,10 @@ static bool isValidGraphGameweeks(uint8_t gameweeks) {
 
 static bool isValidInterval(uint16_t seconds) {
     return seconds >= 5 && seconds <= 600;
+}
+
+static bool isValidBrightnessPct(uint8_t pct) {
+    return pct <= 100;
 }
 
 static void normalizeEntry(const char *in, char *out, size_t outLen) {
@@ -80,6 +89,11 @@ static void saveLocked() {
     }
     prefs.putString(kKeyWatchlist, csv);
     prefs.putBytes(kKeyHiddenLeagues, settings.hiddenLeagueIds, settings.hiddenLeagueCount * sizeof(int));
+    prefs.putUChar(kKeyLedRankBright, settings.ledRankBrightnessPct);
+    prefs.putUChar(kKeyLedDeadlineBright, settings.ledDeadlineBrightnessPct);
+    prefs.putUChar(kKeyLedNotifyBright, settings.ledNotificationBrightnessPct);
+    prefs.putBool(kKeyLedRankLiveGw, settings.ledRankOnlyLiveGw);
+    prefs.putBool(kKeyLedRankMatch, settings.ledRankOnlyMatchLive);
     prefs.end();
 }
 
@@ -88,6 +102,11 @@ static void applyDefaultsLocked() {
     settings.rankGraphGameweeks = FPL_RANK_GRAPH_GAMEWEEKS;
     parseWatchlist(FPL_DEFAULT_WATCHLIST, settings);
     settings.hiddenLeagueCount = 0;
+    settings.ledRankBrightnessPct = FPL_LED_RANK_BRIGHTNESS_PCT;
+    settings.ledDeadlineBrightnessPct = FPL_LED_DEADLINE_BRIGHTNESS_PCT;
+    settings.ledNotificationBrightnessPct = FPL_LED_NOTIFICATION_BRIGHTNESS_PCT;
+    settings.ledRankOnlyLiveGw = FPL_LED_RANK_ONLY_LIVE_GW != 0;
+    settings.ledRankOnlyMatchLive = FPL_LED_RANK_ONLY_MATCH_LIVE != 0;
 }
 
 static bool lock() {
@@ -128,14 +147,32 @@ void displaySettingsInit() {
             prefs.getBytes(kKeyHiddenLeagues, settings.hiddenLeagueIds, hiddenBytes);
             settings.hiddenLeagueCount = hiddenBytes / sizeof(int);
         }
+        const uint8_t rankBright = prefs.getUChar(kKeyLedRankBright, settings.ledRankBrightnessPct);
+        if (isValidBrightnessPct(rankBright)) {
+            settings.ledRankBrightnessPct = rankBright;
+        }
+        const uint8_t deadlineBright = prefs.getUChar(kKeyLedDeadlineBright, settings.ledDeadlineBrightnessPct);
+        if (isValidBrightnessPct(deadlineBright)) {
+            settings.ledDeadlineBrightnessPct = deadlineBright;
+        }
+        const uint8_t notifyBright = prefs.getUChar(kKeyLedNotifyBright, settings.ledNotificationBrightnessPct);
+        if (isValidBrightnessPct(notifyBright)) {
+            settings.ledNotificationBrightnessPct = notifyBright;
+        }
+        settings.ledRankOnlyLiveGw = prefs.getBool(kKeyLedRankLiveGw, settings.ledRankOnlyLiveGw);
+        settings.ledRankOnlyMatchLive = prefs.getBool(kKeyLedRankMatch, settings.ledRankOnlyMatchLive);
         prefs.end();
     }
     settings.version = 1;
     settings.watchlistVersion = 1;
 
-    Serial.printf("[SETTINGS] screen interval %us, rank graph %u GWs, %u watched, %u hidden leagues\n",
+    Serial.printf("[SETTINGS] screen interval %us, rank graph %u GWs, %u watched, %u hidden leagues | LED rank %u%%%s%s, "
+                  "deadline %u%%, notification %u%%\n",
                   settings.screenIntervalSec, settings.rankGraphGameweeks, static_cast<unsigned>(settings.watchCount),
-                  static_cast<unsigned>(settings.hiddenLeagueCount));
+                  static_cast<unsigned>(settings.hiddenLeagueCount), settings.ledRankBrightnessPct,
+                  settings.ledRankOnlyLiveGw ? " (live GW only)" : "",
+                  settings.ledRankOnlyMatchLive ? " (match in play only)" : "", settings.ledDeadlineBrightnessPct,
+                  settings.ledNotificationBrightnessPct);
 }
 
 void displaySettingsGet(DisplaySettings &out) {
@@ -179,6 +216,58 @@ void displaySettingsReset() {
     }
     applyDefaultsLocked();
     commitLocked(true);
+}
+
+bool displaySettingsApply(const DisplaySettings &next) {
+    if (!isValidInterval(next.screenIntervalSec) || !isValidGraphGameweeks(next.rankGraphGameweeks) ||
+        next.watchCount > kMaxWatchlist || next.hiddenLeagueCount > kMaxHiddenLeagues ||
+        !isValidBrightnessPct(next.ledRankBrightnessPct) || !isValidBrightnessPct(next.ledDeadlineBrightnessPct) ||
+        !isValidBrightnessPct(next.ledNotificationBrightnessPct)) {
+        return false;
+    }
+    static DisplaySettings normalized;  // only touched under the mutex below
+    if (!lock()) {
+        return false;
+    }
+    normalized = settings;
+    normalized.watchCount = 0;
+    for (size_t i = 0; i < next.watchCount; ++i) {
+        char entry[kWatchEntryLen];
+        normalizeEntry(next.watchlist[i], entry, sizeof(entry));
+        bool duplicate = false;
+        for (size_t j = 0; j < normalized.watchCount; ++j) {
+            duplicate = duplicate || strcmp(normalized.watchlist[j], entry) == 0;
+        }
+        if (entry[0] && !strchr(entry, ',') && !duplicate) {
+            strlcpy(normalized.watchlist[normalized.watchCount++], entry, kWatchEntryLen);
+        }
+    }
+    normalized.hiddenLeagueCount = 0;
+    for (size_t i = 0; i < next.hiddenLeagueCount; ++i) {
+        if (next.hiddenLeagueIds[i] <= 0) {
+            xSemaphoreGive(settingsMutex);
+            return false;
+        }
+        normalized.hiddenLeagueIds[normalized.hiddenLeagueCount++] = next.hiddenLeagueIds[i];
+    }
+
+    bool watchlistChanged = normalized.watchCount != settings.watchCount;
+    for (size_t i = 0; !watchlistChanged && i < normalized.watchCount; ++i) {
+        watchlistChanged = strcmp(normalized.watchlist[i], settings.watchlist[i]) != 0;
+    }
+    settings.screenIntervalSec = next.screenIntervalSec;
+    settings.rankGraphGameweeks = next.rankGraphGameweeks;
+    memcpy(settings.watchlist, normalized.watchlist, sizeof(settings.watchlist));
+    settings.watchCount = normalized.watchCount;
+    memcpy(settings.hiddenLeagueIds, normalized.hiddenLeagueIds, sizeof(settings.hiddenLeagueIds));
+    settings.hiddenLeagueCount = normalized.hiddenLeagueCount;
+    settings.ledRankBrightnessPct = next.ledRankBrightnessPct;
+    settings.ledDeadlineBrightnessPct = next.ledDeadlineBrightnessPct;
+    settings.ledNotificationBrightnessPct = next.ledNotificationBrightnessPct;
+    settings.ledRankOnlyLiveGw = next.ledRankOnlyLiveGw;
+    settings.ledRankOnlyMatchLive = next.ledRankOnlyMatchLive;
+    commitLocked(watchlistChanged);
+    return true;
 }
 
 WatchlistResult displaySettingsWatchAdd(const char *entry) {

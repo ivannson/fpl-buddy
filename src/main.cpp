@@ -14,10 +14,13 @@
 #include <cstring>
 #include <new>
 
+#include "device_config.h"
 #include "display_settings.h"
 #include "fpl_config.h"
 #include "led_ring.h"
-#include "wifi_config.h"
+#include "power.h"
+#include "ui_kit.h"
+#include "web_server.h"
 
 LV_FONT_DECLARE(lv_font_montserrat_16);
 LV_FONT_DECLARE(lv_font_montserrat_18);
@@ -33,10 +36,12 @@ static SPD2010Touch touch;
 
 static constexpr uint16_t kDisplayWidth = SPD2010_WIDTH;
 static constexpr uint16_t kDisplayHeight = SPD2010_HEIGHT;
-static constexpr size_t kLvglBufPixels = kDisplayWidth * 40;
+// Two DMA render buffers: LVGL draws the next band while the previous one is being sent to the panel.
+static constexpr size_t kLvglBufPixels = kDisplayWidth * 30;
 
 static lv_display_t *lvglDisp = nullptr;
 static uint8_t *lvglBuf = nullptr;
+static uint8_t *lvglBuf2 = nullptr;
 
 static uint32_t lastPollMs = 0;
 static uint32_t lastWifiRetryMs = 0;
@@ -55,10 +60,8 @@ enum class UiMode {
     Idle,
     Deadline,
     FinalHour,
-    Live,
-    EventPopup,
-    EventsList,
-    Squad
+    Live,  // the live-gameweek carousel (LivePage)
+    EventPopup
 };
 
 struct UiEventItem {
@@ -130,29 +133,37 @@ struct UiWidgets {
     lv_obj_t *idleWatchBody = nullptr;
     lv_obj_t *idleLeaguesBody = nullptr;
 
-    // Idle
-    lv_obj_t *idleRankArrow = nullptr;
+    // Idle (rank page)
     lv_obj_t *idleRankValue = nullptr;
+    lv_obj_t *idleRankMove = nullptr;
+    lv_obj_t *idleGwLabel = nullptr;
     lv_obj_t *idleGwPoints = nullptr;
     lv_obj_t *idleTotalPoints = nullptr;
+    lv_obj_t *idleStatusDot = nullptr;
+    lv_obj_t *idleDots = nullptr;
 
     // Deadline
     lv_obj_t *deadlineLabel = nullptr;
     lv_obj_t *deadlineCountdown = nullptr;
     lv_obj_t *deadlineMeta = nullptr;
+    lv_obj_t *deadlineWhen = nullptr;
 
     // Final hour
     lv_obj_t *finalArc = nullptr;
     lv_obj_t *finalCountdown = nullptr;
+    lv_obj_t *finalMeta = nullptr;
 
     // Live
     lv_obj_t *liveTitle = nullptr;
     lv_obj_t *liveDot = nullptr;
     lv_obj_t *livePoints = nullptr;
     lv_obj_t *liveRank = nullptr;
-    lv_obj_t *liveTickerBtn = nullptr;
+    lv_obj_t *liveRankMove = nullptr;
+    lv_obj_t *liveTickerBtn = nullptr;  // latest-event card
     lv_obj_t *liveTickerLabel = nullptr;
-    lv_obj_t *liveHoldArc = nullptr;
+    lv_obj_t *liveEventBadge = nullptr;
+    lv_obj_t *liveEventDelta = nullptr;
+    lv_obj_t *liveDots = nullptr;
 
     // Popup
     lv_obj_t *popupTitle = nullptr;
@@ -164,9 +175,12 @@ struct UiWidgets {
     // Shared top line / stale
     lv_obj_t *statusLabel = nullptr;
 
-    // Lists
+    // Lists (live carousel pages)
     lv_obj_t *eventsList = nullptr;
+    lv_obj_t *eventsClearBtn = nullptr;
+    lv_obj_t *eventsDots = nullptr;
     lv_obj_t *squadList = nullptr;
+    lv_obj_t *squadDots = nullptr;
 };
 
 static UiWidgets ui;
@@ -262,6 +276,7 @@ struct TeamSnapshot {
     bool hasRankData = false;
     bool hasGwState = false;
     bool isLiveGw = false;
+    bool matchInPlay = false;
     int nextGw = 0;
     bool hasDeadline = false;
     time_t deadlineUtc = 0;
@@ -271,6 +286,9 @@ struct TeamSnapshot {
     TeamPick picks[16];
     size_t pickCount = 0;
 };
+
+// Where the demo squad came from. None = seeded over serial (`demo seed`).
+enum class DemoSource : uint8_t { None = 0, MyTeam, Sample };
 
 struct DemoState {
     bool enabled = false;
@@ -291,11 +309,23 @@ struct DemoState {
     int overallRank = 0;
     int rankDiff = 0;
     bool hasRankData = false;
+
+    // Web demo (Demo tab of the web UI).
+    DemoSource source = DemoSource::None;
+    int pointsAdjust = 0;           // added to the squad's points, so the GW total can be set directly
+    bool autoKickoff = true;        // the gameweek goes live when the deadline passes
+    bool rankFollowsPoints = true;  // scoring events move the overall rank
+    bool stale = false;             // show the data as stale (amber live dot, "FPL fetch failed")
+    int screenRequest = -1;         // DemoScreen for uiTask to show; -1 = none
 };
 
 static LastPickState lastPickStates[16];
 static DemoState demoState;
 static SemaphoreHandle_t demoMutex = nullptr;
+// demoState.enabled, readable without demoMutex (fplTask checks it while holding fplDataMutex).
+static volatile bool demoEnabledFlag = false;
+// Stops the between-gameweeks carousel advancing on its timer (web demo).
+static volatile bool demoCarouselPaused = false;
 enum class ScriptedDemoKind {
     None = 0,
     Notification = 1
@@ -345,6 +375,7 @@ static void squadDemoDeadline45BtnCb(lv_event_t *e);
 static void squadDemoDeadline7BtnCb(lv_event_t *e);
 static void handleSerialCommandLine(char *line);
 static void processSerialInput();
+static bool demoStop();
 
 // ---------------------------------------------------------------------------
 // HTTP transport
@@ -825,6 +856,8 @@ struct PlayerPrice {
     int nowCost = 0;       // tenths of a million
     int projectedPct = 0;  // tenths of a percent toward the next price update; + rise, - fall
     bool locked = false;   // price can't change at the next update
+    char team[24] = "";    // kit slug, e.g. "man_city"; empty if unknown
+    bool isGk = false;
 };
 
 struct PriceData {
@@ -859,7 +892,7 @@ static bool fetchEntrySummary(EntrySummary &out) {
     DynamicJsonDocument doc(16384);
     String url = kFplApiBase;
     url += "entry/";
-    url += String(FPL_ENTRY_ID);
+    url += String(deviceConfigEntryId());
     url += "/";
 
     if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
@@ -906,7 +939,7 @@ static bool fetchRankHistory(RankHistory &out) {
     DynamicJsonDocument doc(4096);
     String url = kFplApiBase;
     url += "entry/";
-    url += String(FPL_ENTRY_ID);
+    url += String(deviceConfigEntryId());
     url += "/history/";
 
     if (!getJsonDocumentFromPsramUrl(url, doc, kSmallJsonMaxBytes, &filter)) {
@@ -943,7 +976,7 @@ static bool fetchPicksForGw(int gw, TeamPick *picks, size_t picksCapacity, size_
     DynamicJsonDocument doc(8192);
     String url = kFplApiBase;
     url += "entry/";
-    url += String(FPL_ENTRY_ID);
+    url += String(deviceConfigEntryId());
     url += "/event/";
     url += String(gw);
     url += "/picks/";
@@ -1201,10 +1234,27 @@ static bool watchEntryMatches(const char *entry, int elementId, const char *asci
     return strcasecmp(entry, asciiWebName) == 0;
 }
 
-static void fillPlayerPrice(JsonObject e, const char *asciiWebName, time_t nowUtc, PlayerPrice &out) {
+struct TeamSlug {
+    int id = 0;
+    char slug[24] = "";
+};
+
+static const char *teamSlugForId(const TeamSlug *teams, size_t teamCount, int teamId) {
+    for (size_t i = 0; i < teamCount; ++i) {
+        if (teams[i].id == teamId) {
+            return teams[i].slug;
+        }
+    }
+    return "";
+}
+
+static void fillPlayerPrice(JsonObject e, const char *asciiWebName, time_t nowUtc, const TeamSlug *teams,
+                            size_t teamCount, PlayerPrice &out) {
     out = PlayerPrice{};
     out.elementId = e["id"] | 0;
     strlcpy(out.name, asciiWebName, sizeof(out.name));
+    strlcpy(out.team, teamSlugForId(teams, teamCount, e["team"] | 0), sizeof(out.team));
+    out.isGk = (e["element_type"] | 0) == 1;
     out.nowCost = e["now_cost"] | 0;
     out.projectedPct = jsonTenths(e["price_change_projections"][0]["projected_percent"]);
     const char *lockedUntil = e["price_change_locked_until"] | nullptr;
@@ -1235,15 +1285,16 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
     elementFilter["now_cost"] = true;
     elementFilter["price_change_locked_until"] = true;
     elementFilter["price_change_projections"][0]["projected_percent"] = true;
+    // Team and position are also needed for the kits on the price screens.
+    elementFilter["element_type"] = true;
+    elementFilter["team"] = true;
+    JsonObject teamFilter = filter["teams"].createNestedObject();
+    teamFilter["id"] = true;
+    teamFilter["name"] = true;
     if (wantMeta) {
-        elementFilter["element_type"] = true;
-        elementFilter["team"] = true;
         JsonObject typeFilter = filter["element_types"].createNestedObject();
         typeFilter["id"] = true;
         typeFilter["singular_name_short"] = true;
-        JsonObject teamFilter = filter["teams"].createNestedObject();
-        teamFilter["id"] = true;
-        teamFilter["name"] = true;
     }
 
     DynamicJsonDocument doc(FPL_BOOTSTRAP_JSON_DOC_CAPACITY);
@@ -1309,6 +1360,20 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
         }
     }
 
+    TeamSlug teamSlugs[24];
+    size_t teamCount = 0;
+#if FPL_ENABLE_NAME_LOOKUP
+    for (JsonObject t : doc["teams"].as<JsonArray>()) {
+        if (teamCount >= (sizeof(teamSlugs) / sizeof(teamSlugs[0]))) {
+            break;
+        }
+        teamSlugs[teamCount].id = t["id"] | 0;
+        slugifyTeamName(t["name"] | "", teamSlugs[teamCount].slug, sizeof(teamSlugs[teamCount].slug));
+        normalizeKitTeamSlug(teamSlugs[teamCount].slug, sizeof(teamSlugs[teamCount].slug));
+        ++teamCount;
+    }
+#endif
+
     bool watchFound[kMaxWatchlist] = {};
     PlayerPrice watchSlots[kMaxWatchlist];
     for (JsonObject e : doc["elements"].as<JsonArray>()) {
@@ -1317,13 +1382,13 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
         sanitizeUtf8ToAscii(e["web_name"] | "", asciiName, sizeof(asciiName));
         for (size_t i = 0; i < pickCount; ++i) {
             if (picks[i].elementId == id && prices.squadCount < 16) {
-                fillPlayerPrice(e, asciiName, nowUtc, prices.squad[prices.squadCount++]);
+                fillPlayerPrice(e, asciiName, nowUtc, teamSlugs, teamCount, prices.squad[prices.squadCount++]);
                 break;
             }
         }
         for (size_t i = 0; i < settings.watchCount; ++i) {
             if (!watchFound[i] && watchEntryMatches(settings.watchlist[i], id, asciiName)) {
-                fillPlayerPrice(e, asciiName, nowUtc, watchSlots[i]);
+                fillPlayerPrice(e, asciiName, nowUtc, teamSlugs, teamCount, watchSlots[i]);
                 watchFound[i] = true;
             }
         }
@@ -1358,22 +1423,6 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
         ++typeCount;
     }
 
-    struct TeamShort {
-        int id = 0;
-        char slug[24] = "";
-    };
-    TeamShort teamNames[24];
-    size_t teamCount = 0;
-    for (JsonObject t : doc["teams"].as<JsonArray>()) {
-        if (teamCount >= (sizeof(teamNames) / sizeof(teamNames[0]))) {
-            break;
-        }
-        teamNames[teamCount].id = t["id"] | 0;
-        slugifyTeamName(t["name"] | "", teamNames[teamCount].slug, sizeof(teamNames[teamCount].slug));
-        normalizeKitTeamSlug(teamNames[teamCount].slug, sizeof(teamNames[teamCount].slug));
-        ++teamCount;
-    }
-
     metaCountOut = 0;
     for (JsonObject e : doc["elements"].as<JsonArray>()) {
         const int id = e["id"] | 0;
@@ -1394,12 +1443,7 @@ static bool fetchBootstrap(GameweekState &stateOut, const TeamPick *picks, size_
                     break;
                 }
             }
-            for (size_t j = 0; j < teamCount; ++j) {
-                if (teamNames[j].id == meta.teamId) {
-                    strlcpy(meta.teamShortName, teamNames[j].slug, sizeof(meta.teamShortName));
-                    break;
-                }
-            }
+            strlcpy(meta.teamShortName, teamSlugForId(teamSlugs, teamCount, meta.teamId), sizeof(meta.teamShortName));
             break;
         }
         if (metaCountOut >= pickCount) {
@@ -1754,7 +1798,8 @@ static const char *iconForEvent(const char *what, int pts) {
     return pts >= 0 ? "+" : "-";
 }
 
-static void notifyEvent(const TeamPick &pick, int pts, const char *what) {
+// Queues a popup for a change of `pts` that took the player to `totalAfter` points.
+static void pushPickEvent(const TeamPick &pick, int pts, const char *what, int totalAfter) {
     const char *name = pick.playerName.length() ? pick.playerName.c_str() : "unknown";
     Serial.printf("[FPL EVENT] %s %+d pt%s, %s\n", name, pts, (pts == 1 || pts == -1) ? "" : "s", what);
 
@@ -1764,11 +1809,15 @@ static void notifyEvent(const TeamPick &pick, int pts, const char *what) {
     sanitizeUtf8ToAscii(name, event.player, sizeof(event.player));
     strlcpy(event.team, pick.teamShortName, sizeof(event.team));
     event.delta = pts;
-    event.totalAfter = pick.live.totalPoints;
-    event.totalBefore = pick.live.totalPoints - pts;
+    event.totalAfter = totalAfter;
+    event.totalBefore = totalAfter - pts;
     event.isGk = (pick.elementType == 1);
     event.epochMs = millis();
     pushUiEvent(event);
+}
+
+static void notifyEvent(const TeamPick &pick, int pts, const char *what) {
+    pushPickEvent(pick, pts, what, pick.live.totalPoints);
 }
 
 static void detectAndNotifyPointChangesFromBreakdown(int gw, const TeamPick *picks, size_t pickCount) {
@@ -2169,6 +2218,27 @@ static uint32_t computeNextPollDelayMs(const FplDataCache &c, bool matchInPlay, 
     return static_cast<uint32_t>(delayMs);
 }
 
+// Whether a fixture of the current GW is in play, and how many have finished. Without this GW's fixtures or a
+// synced clock, falls back to treating the GW as in play (fetch live every poll).
+static bool cacheMatchInPlay(const FplDataCache &c, time_t nowUtc, size_t &finishedFixtures) {
+    const bool clockValid = nowUtc >= kMinValidEpoch;
+    finishedFixtures = 0;
+    if (c.fixturesGw != c.entry.currentGw) {
+        return true;
+    }
+    bool matchInPlay = !clockValid;
+    for (size_t i = 0; i < c.fixtureCount; ++i) {
+        const FixtureWindow &f = c.fixtures[i];
+        if (f.finished) {
+            ++finishedFixtures;
+        } else if (clockValid && f.hasKickoff && nowUtc >= f.kickoffUtc &&
+                   nowUtc - f.kickoffUtc < kFixtureInPlayMaxSec) {
+            matchInPlay = true;
+        }
+    }
+    return matchInPlay;
+}
+
 static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
     const time_t nowUtc = time(nullptr);
     const bool clockValid = nowUtc >= kMinValidEpoch;
@@ -2250,21 +2320,8 @@ static bool refreshFplDataSteps(FplDataCache &c, FplPollResult &result) {
         }
     }
 
-    // Without fixtures or a synced clock, fall back to treating the GW as in play (fetch live every poll).
-    const bool haveFixtures = c.fixturesGw == gw;
-    bool matchInPlay = !haveFixtures || !clockValid;
     size_t finishedFixtures = 0;
-    if (haveFixtures) {
-        for (size_t i = 0; i < c.fixtureCount; ++i) {
-            const FixtureWindow &f = c.fixtures[i];
-            if (f.finished) {
-                ++finishedFixtures;
-            } else if (clockValid && f.hasKickoff && nowUtc >= f.kickoffUtc &&
-                       nowUtc - f.kickoffUtc < kFixtureInPlayMaxSec) {
-                matchInPlay = true;
-            }
-        }
-    }
+    const bool matchInPlay = cacheMatchInPlay(c, nowUtc, finishedFixtures);
     result.matchInPlay = matchInPlay;
 
     // 5) event/{gw}/live/. A newly finished fixture means confirmed bonus, so fetch once more after it.
@@ -2319,9 +2376,14 @@ static void fillSnapshotFromCache(const FplDataCache &c, TeamSnapshot &out) {
     out.overallPoints = c.entry.overallPoints;
     out.hasRankData = c.entry.overallRank > 0 && c.entry.previousOverallRank > 0;
     // Positive means improvement (rank number got smaller).
-    out.rankDiff = out.hasRankData ? c.entry.previousOverallRank - c.entry.overallRank : 0;
+    // No previous rank before the first gameweek has finished: report no movement rather than a huge drop.
+    out.rankDiff = out.hasRankData && c.entry.previousOverallRank > 0
+                       ? c.entry.previousOverallRank - c.entry.overallRank
+                       : 0;
     out.hasGwState = c.hasGwState;
     out.isLiveGw = c.gwState.isLiveGw;
+    size_t finishedFixtures = 0;
+    out.matchInPlay = cacheMatchInPlay(c, time(nullptr), finishedFixtures);
     out.nextGw = c.gwState.nextGw;
     out.hasDeadline = c.gwState.hasDeadline;
     out.deadlineUtc = c.gwState.deadlineUtc;
@@ -2358,6 +2420,18 @@ static void publishIdleScreensFromCache(const FplDataCache &c) {
     IdleScreensData &d = *idleScreensData;
     d.hasHistory = c.historyGw > 0;
     d.history = c.history;
+    // entry/{id}/ is fetched every poll, history only hourly: end the graph on the latest (during a gameweek, live)
+    // overall rank.
+    RankHistory &h = d.history;
+    if (d.hasHistory && c.hasEntry && c.entry.overallRank > 0 && c.entry.currentGw > 0) {
+        if (h.count > 0 && h.gw[h.count - 1] == c.entry.currentGw) {
+            h.overallRank[h.count - 1] = c.entry.overallRank;
+        } else if ((h.count == 0 || h.gw[h.count - 1] < c.entry.currentGw) && h.count < kMaxGameweeks) {
+            h.gw[h.count] = c.entry.currentGw;
+            h.overallRank[h.count] = c.entry.overallRank;
+            ++h.count;
+        }
+    }
     d.hasPrices = c.hasPrices;
     d.prices = c.prices;
     // Prices were parsed for the squad at the last bootstrap fetch; drop players transferred out since.
@@ -2409,7 +2483,7 @@ static bool fetchTeamSnapshot(TeamSnapshot &out) {
 
 static void printTeamSnapshot(TeamSnapshot &snapshot) {
     Serial.println("\n=== FPL Team Snapshot ===");
-    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", FPL_ENTRY_ID, snapshot.currentGw, snapshot.gwPoints);
+    Serial.printf("Entry ID: %d | GW: %d | GW points: %d\n", deviceConfigEntryId(), snapshot.currentGw, snapshot.gwPoints);
     if (snapshot.overallRank > 0) {
         Serial.printf("Overall rank: %d\n", snapshot.overallRank);
     }
@@ -2452,62 +2526,142 @@ static void printTeamSnapshot(TeamSnapshot &snapshot) {
     Serial.println("=========================\n");
 }
 
+// Dev aid: the `screenshot` serial command redraws the whole display into this PSRAM frame and prints it as hex
+// rows ("SS <row> <hex>" between "SS BEGIN w h" and "SS END"). UI task only, apart from the request fields.
+static uint16_t *screenshotFrame = nullptr;
+static bool screenshotCapturing = false;
+static volatile bool screenshotRequested = false;
+// IdlePage to show first, kIdlePageCount = events list, + 1 = squad, + 2 = squad scrolled to the end,
+// -1 = the current screen.
+static volatile int screenshotPage = -1;
+static uint32_t screenshotAtMs = 0;
+
+// The panel takes columns in groups of 4, so redraw areas are widened to 4-pixel boundaries.
+static void lvglRounderCb(lv_event_t *e) {
+    lv_area_t *area = static_cast<lv_area_t *>(lv_event_get_param(e));
+    area->x1 &= ~0x3;
+    area->x2 |= 0x3;
+}
+
+// Dev aid for the `fps` serial command: frame timings while the carousel animates to its next page.
+static volatile bool fpsRequested = false;
+static uint32_t fpsStartMs = 0;  // 0 = not measuring
+static uint32_t fpsFrames = 0;
+static uint32_t fpsFrameStartMs = 0;
+static uint32_t fpsLongestMs = 0;
+static uint32_t fpsFlushUs = 0;  // time spent handing bands to the panel (includes waiting for the previous one)
+static uint32_t fpsFlushes = 0;
+static volatile uint32_t fpsDmaQueuedUs = 0;
+static volatile uint32_t fpsDmaUs = 0;     // queue-to-done time of the panel transfers
+static volatile uint32_t fpsDmaBytes = 0;
+
+static void lvglFrameTimingCb(lv_event_t *e) {
+    if (fpsStartMs == 0) {
+        return;
+    }
+    if (lv_event_get_code(e) == LV_EVENT_REFR_START) {
+        fpsFrameStartMs = millis();
+        return;
+    }
+    const uint32_t frameMs = millis() - fpsFrameStartMs;
+    fpsLongestMs = frameMs > fpsLongestMs ? frameMs : fpsLongestMs;
+    ++fpsFrames;
+}
+
+// Runs from the SPI interrupt when the panel has taken a band: its buffer can be rendered into again.
+static void lvglTransferDone(void *ctx) {
+    if (fpsStartMs != 0) {
+        fpsDmaUs += micros() - fpsDmaQueuedUs;
+    }
+    lv_display_flush_ready(static_cast<lv_display_t *>(ctx));
+}
+
 static void lvglFlushCb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
     const int x1 = area->x1;
     const int y1 = area->y1;
-    const int x2 = area->x2;
-    const int y2 = area->y2;
-    const int w = x2 - x1 + 1;
-    const int h = y2 - y1 + 1;
+    const int w = area->x2 - x1 + 1;
+    const int h = area->y2 - y1 + 1;
 
-    display.drawBitmap(x1, y1, w, h, px_map);
-    lv_display_flush_ready(disp);
+    if (screenshotCapturing && screenshotFrame) {
+        const uint16_t *src = reinterpret_cast<const uint16_t *>(px_map);
+        for (int y = 0; y < h; ++y) {
+            memcpy(screenshotFrame + (y1 + y) * kDisplayWidth + x1, src + y * w, static_cast<size_t>(w) * 2);
+        }
+    }
+    // LVGL already renders in the panel's byte order (RGB565_SWAPPED), so the band goes out as is.
+    const uint32_t flushStartUs = micros();
+    fpsDmaQueuedUs = flushStartUs;
+    fpsDmaBytes += static_cast<uint32_t>(w) * h * 2;
+    const bool queued = display.drawBitmapAsync(x1, y1, w, h, px_map);
+    if (fpsStartMs != 0) {
+        fpsFlushUs += micros() - flushStartUs;
+        ++fpsFlushes;
+    }
+    if (!queued) {
+        lv_display_flush_ready(disp);
+    }
 }
 
 static uint32_t lvglTickCb(void) {
     return millis();
 }
 
+// Current press, for the hold-to-enter-setup gesture (serviceSetupHold). UI task only.
+// A press ends only after this many consecutive "not touched" reads spanning kTouchReleaseDebounceMs, so a
+// dropped touch sample doesn't end it. Counting reads (not time since the last touch) matters: reads only
+// happen between redraws, and a full-screen redraw takes longer than the debounce.
+// Holding anywhere on the screen shows a countdown after kSetupHoldPromptMs; at kSetupHoldTriggerMs the device
+// restarts into setup mode (or, when already in setup mode, restarts back to normal WiFi).
+static constexpr uint32_t kSetupHoldPromptMs = 2000;
+static constexpr uint32_t kSetupHoldTriggerMs = 7000;
+// A press longer than this is not a tap, so letting go of a cancelled setup hold doesn't turn the page.
+static constexpr uint32_t kTapMaxMs = 1000;
+
+static constexpr uint32_t kTouchReleaseDebounceMs = 150;
+static constexpr uint8_t kTouchReleaseReads = 3;
+static uint32_t touchPressStartMs = 0;  // 0 = not pressed
+static uint32_t touchReleasedSinceMs = 0;
+static uint8_t touchReleasedReads = 0;
+static uint32_t touchLastPressMs = 0;  // how long the last finished press lasted
+static lv_point_t touchLastPoint = {0, 0};
+
+// LVGL gets the same debounced press: getTouch reports "not touched" when polled too soon after the last read or
+// when a controller read fails, and passing that dropout on would make one tap two clicks (two page turns).
 static void lvglTouchCb(lv_indev_t *, lv_indev_data_t *data) {
     int x = 0;
     int y = 0;
     if (touch.getTouch(&x, &y)) {
-        data->point.x = x;
-        data->point.y = y;
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
+        if (touchPressStartMs == 0) {
+            touchPressStartMs = millis();
+        }
+        touchReleasedReads = 0;
+        touchLastPoint.x = x;
+        touchLastPoint.y = y;
+    } else if (touchPressStartMs != 0) {
+        const uint32_t now = millis();
+        if (touchReleasedReads++ == 0) {
+            touchReleasedSinceMs = now;
+        } else if (touchReleasedReads >= kTouchReleaseReads && now - touchReleasedSinceMs >= kTouchReleaseDebounceMs) {
+            touchLastPressMs = touchReleasedSinceMs - touchPressStartMs;
+            if (touchLastPressMs >= kSetupHoldPromptMs) {
+                Serial.printf("[SETUP] long press released after %u ms\n", static_cast<unsigned>(touchLastPressMs));
+            }
+            touchPressStartMs = 0;
+            touchReleasedReads = 0;
+        }
     }
+    data->point = touchLastPoint;
+    data->state = touchPressStartMs != 0 ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+// For LV_EVENT_CLICKED handlers: true unless the finger was down long enough to be a (cancelled) setup hold.
+static bool isTap() {
+    const uint32_t pressMs = touchPressStartMs != 0 ? millis() - touchPressStartMs : touchLastPressMs;
+    return pressMs < kTapMaxMs;
 }
 
 static void formatNumberWithCommas(int value, char *out, size_t outLen) {
-    if (!out || outLen == 0) {
-        return;
-    }
-    char raw[24];
-    snprintf(raw, sizeof(raw), "%d", value);
-    const int rawLen = static_cast<int>(strlen(raw));
-    if (rawLen <= 3) {
-        strlcpy(out, raw, outLen);
-        return;
-    }
-
-    char rev[32];
-    int idx = 0;
-    int digits = 0;
-    for (int i = rawLen - 1; i >= 0; --i) {
-        rev[idx++] = raw[i];
-        ++digits;
-        if (digits == 3 && i > 0) {
-            rev[idx++] = ',';
-            digits = 0;
-        }
-    }
-    int outIdx = 0;
-    for (int i = idx - 1; i >= 0 && static_cast<size_t>(outIdx + 1) < outLen; --i) {
-        out[outIdx++] = rev[i];
-    }
-    out[outIdx] = '\0';
+    uiFormatThousands(value, out, outLen);
 }
 
 static constexpr uint32_t kColorBgDeep = 0x1A0533;
@@ -2518,10 +2672,8 @@ static constexpr uint32_t kColorAccentGreen = 0x00FF87;
 static constexpr uint32_t kColorAccentRed = 0xFF2882;
 static constexpr uint32_t kColorAccentAmber = 0xFFC107;
 static constexpr uint32_t kColorAccentCyan = 0x00E5FF;
-static constexpr uint32_t kColorButtonPurple = 0x6A3DFF;
 
 static const lv_font_t *kFontHero = &lv_font_montserrat_48;
-static const lv_font_t *kFontLarge = &lv_font_montserrat_32;
 static const lv_font_t *kFontBody = &lv_font_montserrat_20;
 static const lv_font_t *kFontCaption = &lv_font_montserrat_18;
 static const lv_font_t *kFontMicro = &lv_font_montserrat_14;
@@ -2529,19 +2681,39 @@ static const lv_font_t *kFontMicro = &lv_font_montserrat_14;
 static uint32_t popupHideAtMs = 0;
 static constexpr uint32_t kPopupDisplayDurationMs = 4000U;
 static uint32_t lastTickerRotateMs = 0;
-static uint32_t lastDeadlineBlinkMs = 0;
-static bool deadlineColonVisible = true;
 static size_t tickerEventIndex = 0;
-static uint32_t holdStartMs = 0;
-static bool holdTriggered = false;
 static uint32_t renderedEventsVersion = 0;
 static uint32_t renderedSquadVersion = 0;
 
 enum class IdlePage : uint8_t { Rank = 0, RankGraph, Prices, Watchlist, Leagues };
 static constexpr uint8_t kIdlePageCount = 5;
 static IdlePage idlePage = IdlePage::Rank;
-static size_t idleLeaguePage = 0;  // the leagues screen pages through leagues before moving on
 static uint32_t idlePageShownMs = 0;
+// List pages page through their rows before the carousel moves on. Shared by both carousels (only one shows).
+static size_t carouselSubPage = 0;
+
+// Live-gameweek carousel: the live score, the events and squad lists, and the between-gameweeks mini league
+// and rank graph screens (showing live ranks), every screenIntervalSec or on tap.
+enum class LivePage : uint8_t { Main = 0, Events, Squad, Leagues, RankGraph };
+static constexpr uint8_t kLivePageCount = 5;
+static LivePage livePage = LivePage::Main;
+static uint32_t livePageShownMs = 0;
+
+// The carousel on screen is the live one (the pop-up sits on top of it).
+static bool inLiveCarousel() {
+    return currentMode == UiMode::Live || currentMode == UiMode::EventPopup;
+}
+
+static lv_obj_t *livePageScreen(LivePage page) {
+    switch (page) {
+        case LivePage::Main: return ui.screenLive;
+        case LivePage::Events: return ui.screenEvents;
+        case LivePage::Squad: return ui.screenSquad;
+        case LivePage::Leagues: return ui.screenIdleLeagues;
+        case LivePage::RankGraph: return ui.screenIdleGraph;
+    }
+    return ui.screenLive;
+}
 
 static lv_obj_t *idlePageScreen(IdlePage page) {
     switch (page) {
@@ -2559,35 +2731,39 @@ static lv_obj_t *modeToScreen(UiMode mode) {
         case UiMode::Idle: return idlePageScreen(idlePage);
         case UiMode::Deadline: return ui.screenDeadline;
         case UiMode::FinalHour: return ui.screenFinalHour;
-        case UiMode::Live: return ui.screenLive;
+        case UiMode::Live: return livePageScreen(livePage);
         case UiMode::EventPopup: return ui.screenPopup;
-        case UiMode::EventsList: return ui.screenEvents;
-        case UiMode::Squad: return ui.screenSquad;
     }
     return ui.screenIdle;
 }
+
+static void renderIdlePage(IdlePage page, bool entering);
+static void renderLivePage(LivePage page, bool entering);
 
 static void loadMode(UiMode mode, lv_screen_load_anim_t anim) {
     if (currentMode == mode) {
         return;
     }
+    const UiMode previous = currentMode;
+    currentMode = mode;  // before rendering: the pages draw the dots of the carousel they belong to
     if (mode == UiMode::Idle) {
         // Entering the between-gameweeks carousel always starts on the rank page.
         idlePage = IdlePage::Rank;
-        idleLeaguePage = 0;
+        carouselSubPage = 0;
         idlePageShownMs = millis();
+        renderIdlePage(idlePage, false);
+    } else if (mode == UiMode::Live) {
+        // The live carousel starts on the score, except when a pop-up hands back to the page it covered.
+        if (previous != UiMode::EventPopup) {
+            livePage = LivePage::Main;
+            carouselSubPage = 0;
+        }
+        livePageShownMs = millis();
+        renderLivePage(livePage, false);
     }
     lv_obj_t *target = modeToScreen(mode);
-    if (!target) {
-        return;
-    }
-    lv_screen_load_anim(target, anim, 200, 0, false);
-    currentMode = mode;
-    // Force one-time rebuild of overlay lists after screen switch.
-    if (mode == UiMode::EventsList) {
-        renderedEventsVersion = 0;
-    } else if (mode == UiMode::Squad) {
-        renderedSquadVersion = 0;
+    if (target) {
+        lv_screen_load_anim(target, anim, 200, 0, false);
     }
 }
 
@@ -2602,16 +2778,8 @@ static lv_obj_t *createLabel(lv_obj_t *parent, const lv_font_t *font, uint32_t c
 static void styleScreen(lv_obj_t *screen, uint32_t bgHex) {
     lv_obj_set_style_bg_color(screen, lv_color_hex(bgHex), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(screen, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_clip_corner(screen, true, LV_PART_MAIN);
-}
-
-static void stylePurpleButton(lv_obj_t *btn) {
-    if (!btn) {
-        return;
-    }
-    lv_obj_set_style_bg_color(btn, lv_color_hex(kColorButtonPurple), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_80, LV_PART_MAIN);
+    // No circular clip: the panel is round anyway, and clipping makes LVGL render every frame through a masked
+    // layer (slow) and leaves the pixels outside the circle unpainted.
 }
 
 static void appendAsciiChar(char *out, size_t outLen, size_t &j, char ch) {
@@ -2689,8 +2857,9 @@ static void sanitizeUtf8ToAscii(const char *in, char *out, size_t outLen) {
     }
 }
 
-static bool loadKitImage(const char *team, const char *type) {
-    if (!team || !team[0] || !type || !type[0]) {
+// Reads /kits/<team>_<type>_110x145.rgb565 (kKitRgb565Bytes) into dst.
+static bool loadKitFile(const char *team, const char *type, uint8_t *dst) {
+    if (!team || !team[0] || !type || !type[0] || !dst) {
         Serial.printf("[KIT] invalid args team='%s' type='%s'\n", team ? team : "(null)", type ? type : "(null)");
         return false;
     }
@@ -2702,7 +2871,7 @@ static bool loadKitImage(const char *team, const char *type) {
         Serial.printf("[KIT] missing file: %s\n", path);
         return false;
     }
-    const size_t bytes = f.read(kitImageBuffer, kKitRgb565Bytes);
+    const size_t bytes = f.read(dst, kKitRgb565Bytes);
     f.close();
     if (bytes != kKitRgb565Bytes) {
         Serial.printf("[KIT] short read: %s (%u/%u)\n", path, static_cast<unsigned>(bytes),
@@ -2713,158 +2882,49 @@ static bool loadKitImage(const char *team, const char *type) {
     return true;
 }
 
+// Goalkeepers fall back to the outfield kit when a team has no keeper kit file.
+static bool loadTeamKit(const char *team, bool isGk, uint8_t *dst) {
+    if (!team || !team[0]) {
+        return false;
+    }
+    if (isGk) {
+        return loadKitFile(team, "gk", dst) || loadKitFile(team, "goalkeeper", dst) ||
+               loadKitFile(team, "outfield", dst);
+    }
+    return loadKitFile(team, "outfield", dst) || loadKitFile(team, "player", dst);
+}
+
 static bool resolveAndLoadKitImage(const UiEventItem &event) {
     if (!event.team[0]) {
         Serial.printf("[KIT] event missing team slug: player='%s' label='%s'\n", event.player, event.label);
         return false;
     }
-    const char *type = event.isGk ? "gk" : "outfield";
-    if (loadKitImage(event.team, type)) {
-        return true;
-    }
-    if (event.isGk && loadKitImage(event.team, "goalkeeper")) {
-        return true;
-    }
-    if (event.isGk && loadKitImage(event.team, "outfield")) {
-        return true;
-    }
-    if (!event.isGk && loadKitImage(event.team, "player")) {
-        return true;
-    }
-    return false;
-}
-
-static void refreshEventsList(const UiRuntimeState &runtime) {
-    if (!ui.eventsList) {
-        return;
-    }
-    lv_obj_clean(ui.eventsList);
-    if (runtime.recentEventCount == 0) {
-        lv_obj_t *empty = createLabel(ui.eventsList, kFontCaption, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-        lv_label_set_text(empty, "No events yet");
-        lv_obj_center(empty);
-        return;
-    }
-
-    for (int i = static_cast<int>(runtime.recentEventCount) - 1; i >= 0; --i) {
-        const UiEventItem &e = runtime.recentEvents[i];
-        lv_obj_t *row = lv_obj_create(ui.eventsList);
-        lv_obj_set_size(row, lv_pct(100), 36);
-        lv_obj_set_style_min_height(row, 36, LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
-        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
-        lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
-        lv_obj_set_style_border_color(row, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
-
-        lv_obj_t *left = createLabel(row, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_LEFT);
-        char leftBuf[48];
-        snprintf(leftBuf, sizeof(leftBuf), "%s %s", e.icon, e.player);
-        lv_label_set_text(left, leftBuf);
-        lv_obj_align(left, LV_ALIGN_LEFT_MID, 6, 0);
-
-        lv_obj_t *right = createLabel(row, kFontBody, e.delta >= 0 ? kColorAccentGreen : kColorAccentRed,
-                                      LV_TEXT_ALIGN_RIGHT);
-        char rightBuf[16];
-        snprintf(rightBuf, sizeof(rightBuf), "%+d", e.delta);
-        lv_label_set_text(right, rightBuf);
-        lv_obj_align(right, LV_ALIGN_RIGHT_MID, -6, 0);
-    }
-}
-
-static void refreshSquadList(const UiRuntimeState &runtime) {
-    if (!ui.squadList) {
-        return;
-    }
-    lv_obj_clean(ui.squadList);
-    for (size_t i = 0; i < runtime.squadCount; ++i) {
-        const UiSquadRow &rowData = runtime.squadRows[i];
-        lv_obj_t *row = lv_obj_create(ui.squadList);
-        lv_obj_set_size(row, lv_pct(100), 34);
-        lv_obj_set_style_min_height(row, 34, LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
-        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
-        lv_obj_set_style_pad_all(row, 0, LV_PART_MAIN);
-
-        lv_obj_t *name = createLabel(row, &lv_font_montserrat_18, rowData.isBench ? kColorTextSecondary : kColorTextPrimary,
-                                     LV_TEXT_ALIGN_LEFT);
-        char nameBuf[48];
-        snprintf(nameBuf, sizeof(nameBuf), "%s%s%s", rowData.player, rowData.isCaptain ? " C" : "",
-                 rowData.isViceCaptain ? " V" : "");
-        lv_label_set_text(name, nameBuf);
-        lv_obj_align(name, LV_ALIGN_LEFT_MID, 6, 0);
-
-        lv_obj_t *breakdown = createLabel(row, &lv_font_montserrat_16, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-        lv_label_set_text(breakdown, rowData.breakdown);
-        lv_obj_align(breakdown, LV_ALIGN_CENTER, 28, 0);
-
-        lv_obj_t *points = createLabel(row, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_RIGHT);
-        char ptsBuf[12];
-        if (rowData.hasPlayed) {
-            snprintf(ptsBuf, sizeof(ptsBuf), "%d", rowData.points);
-        } else {
-            strlcpy(ptsBuf, "-", sizeof(ptsBuf));
-        }
-        lv_label_set_text(points, ptsBuf);
-        lv_obj_align(points, LV_ALIGN_RIGHT_MID, -8, 0);
-    }
-
-    lv_obj_t *footer = lv_obj_create(ui.squadList);
-    lv_obj_set_size(footer, lv_pct(100), 42);
-    lv_obj_set_style_bg_opa(footer, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(footer, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(footer, 0, LV_PART_MAIN);
-
-    static constexpr int kFooterBtnW = 100;
-    static constexpr int kFooterBtnH = 32;
-    static constexpr int kFooterGap = 6;
-
-    lv_obj_t *demoBtn1 = lv_button_create(footer);
-    lv_obj_set_size(demoBtn1, kFooterBtnW, kFooterBtnH);
-    lv_obj_align(demoBtn1, LV_ALIGN_LEFT_MID, 6, 0);
-    stylePurpleButton(demoBtn1);
-    lv_obj_set_style_border_width(demoBtn1, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(demoBtn1, squadDemoNotificationBtnCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *demoBtn1Label = createLabel(demoBtn1, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(demoBtn1Label, "Notify");
-    lv_obj_center(demoBtn1Label);
-
-    lv_obj_t *demoBtn2 = lv_button_create(footer);
-    lv_obj_set_size(demoBtn2, kFooterBtnW, kFooterBtnH);
-    lv_obj_align_to(demoBtn2, demoBtn1, LV_ALIGN_OUT_RIGHT_MID, kFooterGap, 0);
-    stylePurpleButton(demoBtn2);
-    lv_obj_set_style_border_width(demoBtn2, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(demoBtn2, squadDemoDeadline45BtnCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *demoBtn2Label = createLabel(demoBtn2, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(demoBtn2Label, "45m");
-    lv_obj_center(demoBtn2Label);
-
-    lv_obj_t *demoBtn3 = lv_button_create(footer);
-    lv_obj_set_size(demoBtn3, kFooterBtnW, kFooterBtnH);
-    lv_obj_align_to(demoBtn3, demoBtn2, LV_ALIGN_OUT_RIGHT_MID, kFooterGap, 0);
-    stylePurpleButton(demoBtn3);
-    lv_obj_set_style_border_width(demoBtn3, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(demoBtn3, squadDemoDeadline7BtnCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *demoBtn3Label = createLabel(demoBtn3, &lv_font_montserrat_14, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(demoBtn3Label, "7m");
-    lv_obj_center(demoBtn3Label);
+    return loadTeamKit(event.team, event.isGk, kitImageBuffer);
 }
 
 // ---------------------------------------------------------------------------
 // Between-gameweeks carousel
-// Rank -> rank graph -> squad price changes -> watchlist -> mini leagues, every screenIntervalSec or on tap.
-// Pages with nothing to show are skipped (the rank page is always shown).
+// Rank -> rank history -> squad price changes -> watchlist -> mini leagues, every screenIntervalSec or on tap.
+// Pages with nothing to show are skipped (the rank page is always shown). List pages show up to kRowsPerPage
+// rows and page through the rest before the carousel moves on. Built from the ui_kit components.
 // ---------------------------------------------------------------------------
-static constexpr size_t kLeaguesPerPage = 5;
-static constexpr size_t kPriceRowsMax = 6;
-static constexpr int kIdleRowW = 300;
+static constexpr size_t kRowsPerPage = 3;
+static constexpr int kRowH = 78;
+static constexpr int kRowGap = 10;
+static constexpr int kRowBlockCy = 10;  // centre of the row block, from the screen centre
+static constexpr int kRowMaxW = 300;
+static constexpr int kRowPadX = 16;
+
+// fplTask's status text after a successful poll; the rank page turns it into "Updated 5m ago".
+static const char kStatusFplUpdated[] = "FPL updated";
 
 static IdleScreensData *idleUiData = nullptr;      // PSRAM; uiTask's copy
 static IdleScreensData *serialIdleData = nullptr;  // PSRAM; serial commands' copy
 static DisplaySettings idleUiSettings;
 static uint32_t idleUiDataVersion = 0;
 static uint32_t idleUiSettingsVersion = 0;
+
+static int64_t daysFromCivil(int y, unsigned m, unsigned d);
 
 // 950 -> "950", 56,800 -> "57k", 1,234,567 -> "1.2M".
 static void formatRankCompact(int rank, char *out, size_t outLen) {
@@ -2877,8 +2937,9 @@ static void formatRankCompact(int rank, char *out, size_t outLen) {
     }
 }
 
+// 95 -> "£9.5m"
 static void formatPrice(int tenths, char *out, size_t outLen) {
-    snprintf(out, outLen, "%d.%dm", tenths / 10, tenths % 10);
+    snprintf(out, outLen, UI_POUND "%d.%dm", tenths / 10, tenths % 10);
 }
 
 // +1 rise, -1 fall, 0 no change expected at the next price update.
@@ -2896,6 +2957,37 @@ static int expectedPriceDirection(const PlayerPrice &p) {
     return 0;
 }
 
+// When the next price update happens, relative to today: "tonight 23:00", "tomorrow 23:00", "Sat 23:00".
+// Empty when unknown. `tonightOut` is set when it happens later today.
+static void formatNextPriceUpdate(char *out, size_t outLen, bool *tonightOut = nullptr) {
+    out[0] = '\0';
+    if (tonightOut) {
+        *tonightOut = false;
+    }
+    const time_t now = time(nullptr);
+    if (!idleUiData->prices.hasNextUpdate || now < kMinValidEpoch) {
+        return;
+    }
+    const time_t t = idleUiData->prices.nextUpdateUtc;
+    struct tm today;
+    struct tm update;
+    localtime_r(&now, &today);
+    localtime_r(&t, &update);
+    const int64_t days = daysFromCivil(update.tm_year + 1900, update.tm_mon + 1, update.tm_mday) -
+                         daysFromCivil(today.tm_year + 1900, today.tm_mon + 1, today.tm_mday);
+    static const char *const kWeekdays[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+    const char *day = kWeekdays[update.tm_wday % 7];
+    if (days == 0) {
+        day = update.tm_hour >= 17 ? "tonight" : "today";
+    } else if (days == 1) {
+        day = "tomorrow";
+    }
+    snprintf(out, outLen, "%s %02d:%02d", day, update.tm_hour, update.tm_min);
+    if (tonightOut) {
+        *tonightOut = days == 0;
+    }
+}
+
 static size_t visibleLeagues(const MiniLeague **out, size_t capacity) {
     size_t n = 0;
     if (!idleUiData->hasLeagues) {
@@ -2909,10 +3001,23 @@ static size_t visibleLeagues(const MiniLeague **out, size_t capacity) {
     return n;
 }
 
-static size_t leaguePageCount() {
-    const MiniLeague *leagues[kMaxMiniLeagues];
-    const size_t n = visibleLeagues(leagues, kMaxMiniLeagues);
-    return (n + kLeaguesPerPage - 1) / kLeaguesPerPage;
+// Squad players expected to change price at the next update: rises first, strongest projection first.
+static size_t squadPriceChanges(const PlayerPrice **out, size_t capacity) {
+    const PriceData &prices = idleUiData->prices;
+    size_t n = 0;
+    for (size_t i = 0; i < prices.squadCount && n < capacity; ++i) {
+        if (expectedPriceDirection(prices.squad[i]) != 0) {
+            out[n++] = &prices.squad[i];
+        }
+    }
+    for (size_t i = 1; i < n; ++i) {
+        for (size_t j = i; j > 0 && out[j]->projectedPct > out[j - 1]->projectedPct; --j) {
+            const PlayerPrice *tmp = out[j - 1];
+            out[j - 1] = out[j];
+            out[j] = tmp;
+        }
+    }
+    return n;
 }
 
 // Index range of the history entries shown on the graph (last N gameweeks, or all).
@@ -2920,6 +3025,30 @@ static size_t rankGraphFirstIndex() {
     const size_t count = idleUiData->history.count;
     const size_t wanted = idleUiSettings.rankGraphGameweeks;
     return (wanted == 0 || wanted >= count) ? 0 : count - wanted;
+}
+
+static size_t rowPages(size_t rows) {
+    return rows <= 1 ? 1 : (rows + kRowsPerPage - 1) / kRowsPerPage;
+}
+
+// How many screens a carousel page takes (list pages show kRowsPerPage rows per screen).
+static size_t idleSubPageCount(IdlePage page) {
+    switch (page) {
+        case IdlePage::Prices: {
+            const PlayerPrice *changes[16];
+            return rowPages(squadPriceChanges(changes, 16));
+        }
+        case IdlePage::Watchlist:
+            return rowPages(idleUiData->prices.watchCount);
+        case IdlePage::Leagues: {
+            const MiniLeague *leagues[kMaxMiniLeagues];
+            return rowPages(visibleLeagues(leagues, kMaxMiniLeagues));
+        }
+        case IdlePage::Rank:
+        case IdlePage::RankGraph:
+            break;
+    }
+    return 1;
 }
 
 static bool idlePageAvailable(IdlePage page) {
@@ -2932,93 +3061,437 @@ static bool idlePageAvailable(IdlePage page) {
             return idleUiData->hasPrices;
         case IdlePage::Watchlist:
             return idleUiSettings.watchCount > 0 && idleUiData->hasPrices && idleUiData->prices.watchCount > 0;
-        case IdlePage::Leagues:
-            return leaguePageCount() > 0;
+        case IdlePage::Leagues: {
+            const MiniLeague *leagues[kMaxMiniLeagues];
+            return visibleLeagues(leagues, kMaxMiniLeagues) > 0;
+        }
     }
     return false;
 }
 
-static void idleTapEventCb(lv_event_t *);
+static bool livePageAvailable(LivePage page) {
+    switch (page) {
+        case LivePage::Leagues: return idlePageAvailable(IdlePage::Leagues);
+        case LivePage::RankGraph: return idlePageAvailable(IdlePage::RankGraph);
+        case LivePage::Main:
+        case LivePage::Events:
+        case LivePage::Squad:
+            break;
+    }
+    return true;
+}
 
+static lv_obj_t *idlePageBody(IdlePage page) {
+    switch (page) {
+        case IdlePage::Rank: return ui.idleDots;
+        case IdlePage::RankGraph: return ui.idleGraphBody;
+        case IdlePage::Prices: return ui.idlePricesBody;
+        case IdlePage::Watchlist: return ui.idleWatchBody;
+        case IdlePage::Leagues: return ui.idleLeaguesBody;
+    }
+    return nullptr;
+}
+
+static void carouselTapEventCb(lv_event_t *);
+
+// A carousel screen with a full-screen, non-clickable body that is rebuilt when its data changes (taps fall
+// through to the screen).
 static lv_obj_t *createIdleCarouselScreen(lv_obj_t *&bodyOut) {
     lv_obj_t *screen = lv_obj_create(nullptr);
-    styleScreen(screen, kColorBgDeep);
+    styleScreen(screen, kUiBg);
     lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(screen, idleTapEventCb, LV_EVENT_CLICKED, nullptr);
-
-    lv_obj_t *body = lv_obj_create(screen);
-    lv_obj_remove_style_all(body);
-    lv_obj_set_size(body, kDisplayWidth, kDisplayHeight);
-    lv_obj_set_pos(body, 0, 0);
-    lv_obj_remove_flag(body, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
-    bodyOut = body;
+    lv_obj_add_event_cb(screen, carouselTapEventCb, LV_EVENT_CLICKED, nullptr);
+    bodyOut = uiBox(screen, kUiScreenSize, kUiScreenSize);
+    lv_obj_set_pos(bodyOut, 0, 0);
     return screen;
 }
 
-static void createIdleTitle(lv_obj_t *body, const char *title, const char *subtitle) {
-    lv_obj_t *titleLabel = createLabel(body, kFontCaption, kColorAccentCyan, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(titleLabel, title);
-    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 46);
-    if (subtitle && subtitle[0]) {
-        lv_obj_t *subtitleLabel = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-        lv_label_set_text(subtitleLabel, subtitle);
-        lv_obj_align(subtitleLabel, LV_ALIGN_TOP_MID, 0, 72);
-    }
-}
-
-// A transparent row centred horizontally at vertical offset `yOffset` from the screen centre.
-static lv_obj_t *createIdleRow(lv_obj_t *body, int yOffset, int height) {
-    lv_obj_t *row = lv_obj_create(body);
-    lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, kIdleRowW, height);
-    lv_obj_align(row, LV_ALIGN_CENTER, 0, yOffset);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, LV_PART_MAIN);
-    lv_obj_set_style_border_width(row, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(row, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
-    return row;
-}
-
-static lv_obj_t *createRowLabel(lv_obj_t *row, const lv_font_t *font, uint32_t colorHex, lv_align_t align, int xOfs,
-                                int width, const char *text) {
-    const lv_text_align_t textAlign = align == LV_ALIGN_RIGHT_MID ? LV_TEXT_ALIGN_RIGHT : LV_TEXT_ALIGN_LEFT;
-    lv_obj_t *label = createLabel(row, font, colorHex, textAlign);
-    if (width > 0) {
-        lv_obj_set_width(label, width);
-        lv_label_set_long_mode(label, LV_LABEL_LONG_MODE_DOTS);
-    }
-    lv_label_set_text(label, text);
-    lv_obj_align(label, align, xOfs, 0);
-    return label;
-}
-
-static void createIdleMessage(lv_obj_t *body, const char *text) {
-    lv_obj_t *label = createLabel(body, kFontBody, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_set_width(label, 280);
-    lv_label_set_text(label, text);
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-}
-
-// Row centres for `rows` rows of `rowH`, laid out around a point slightly below the screen centre.
-static int idleRowY(size_t index, size_t rows, int rowH) {
-    const int blockH = static_cast<int>(rows) * rowH;
-    return 10 - blockH / 2 + rowH / 2 + static_cast<int>(index) * rowH;
-}
-
-static void formatNextPriceUpdate(char *out, size_t outLen) {
-    out[0] = '\0';
-    if (!idleUiData->prices.hasNextUpdate || time(nullptr) < kMinValidEpoch) {
+// Page dots for the pages currently in the carousel, with the one on screen highlighted.
+static void addCarouselDots(lv_obj_t *parent) {
+    uint8_t count = 0;
+    uint8_t active = 0;
+    if (inLiveCarousel()) {
+        for (uint8_t i = 0; i < kLivePageCount; ++i) {
+            const LivePage page = static_cast<LivePage>(i);
+            if (!livePageAvailable(page)) {
+                continue;
+            }
+            if (page == livePage) {
+                active = count;
+            }
+            ++count;
+        }
+        uiPageDots(parent, count, active);
         return;
     }
-    const time_t t = idleUiData->prices.nextUpdateUtc;
-    struct tm local;
-    localtime_r(&t, &local);
-    snprintf(out, outLen, "next update %02d:%02d", local.tm_hour, local.tm_min);
+    for (uint8_t i = 0; i < kIdlePageCount; ++i) {
+        const IdlePage page = static_cast<IdlePage>(i);
+        if (!idlePageAvailable(page)) {
+            continue;
+        }
+        if (page == idlePage) {
+            active = count;
+        }
+        ++count;
+    }
+    uiPageDots(parent, count, active);
 }
 
-static void renderRankGraphPage() {
+// --- Kit thumbnails -------------------------------------------------------------------------------------------
+// Kits are 110x145 RGB565 drawn on the screen background. For the price screens they're box-filtered down by an
+// integer factor into RGB565A8 with the background keyed out, so they sit cleanly on card surfaces. The prices
+// and watchlist pages use separate slots so a page sliding out keeps its kits while the next one renders.
+static constexpr size_t kKitThumbSlots = 2 * kRowsPerPage;
+static constexpr size_t kPricesKitSlot = 0;
+static constexpr size_t kWatchKitSlot = kRowsPerPage;
+static constexpr int kKitRowFactor = 3;        // 36x48 in list rows
+static constexpr int kKitSpotlightFactor = 2;  // 55x72 when a page shows a single player
+
+struct KitThumb {
+    char key[40] = "";
+    lv_image_dsc_t dsc = {};
+    uint8_t *data = nullptr;  // PSRAM, sized for the smallest factor
+};
+static KitThumb kitThumbs[kKitThumbSlots];
+static uint8_t *kitScratch = nullptr;  // PSRAM, kKitRgb565Bytes
+
+static const lv_image_dsc_t *kitThumb(size_t slot, const char *team, bool isGk, int factor) {
+    if (slot >= kKitThumbSlots || !team || !team[0] || factor < kKitSpotlightFactor) {
+        return nullptr;
+    }
+    KitThumb &t = kitThumbs[slot];
+    char key[sizeof(t.key)];
+    snprintf(key, sizeof(key), "%s/%c/%d", team, isGk ? 'g' : 'o', factor);
+    if (t.data && strcmp(t.key, key) == 0) {
+        return &t.dsc;
+    }
+    static constexpr size_t kMaxThumbBytes =
+        static_cast<size_t>(kKitWidth / kKitSpotlightFactor) * (kKitHeight / kKitSpotlightFactor) * 3;
+    if (!kitScratch) {
+        kitScratch = static_cast<uint8_t *>(heap_caps_malloc(kKitRgb565Bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    if (!t.data) {
+        t.data = static_cast<uint8_t *>(heap_caps_malloc(kMaxThumbBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
+    t.key[0] = '\0';
+    if (!kitScratch || !t.data || !loadTeamKit(team, isGk, kitScratch)) {
+        return nullptr;
+    }
+
+    const int w = kKitWidth / factor;
+    const int h = kKitHeight / factor;
+    const uint16_t *src = reinterpret_cast<const uint16_t *>(kitScratch);
+    const uint16_t background = src[0];  // the corner pixel is always background
+    uint16_t *rgb = reinterpret_cast<uint16_t *>(t.data);
+    uint8_t *alpha = t.data + static_cast<size_t>(w) * h * 2;
+    const int area = factor * factor;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint32_t r = 0;
+            uint32_t g = 0;
+            uint32_t b = 0;
+            int opaque = 0;
+            for (int dy = 0; dy < factor; ++dy) {
+                const uint16_t *line = src + (y * factor + dy) * kKitWidth + x * factor;
+                for (int dx = 0; dx < factor; ++dx) {
+                    const uint16_t v = line[dx];
+                    if (v == background) {
+                        continue;
+                    }
+                    r += v >> 11;
+                    g += (v >> 5) & 0x3F;
+                    b += v & 0x1F;
+                    ++opaque;
+                }
+            }
+            const size_t i = static_cast<size_t>(y) * w + x;
+            if (opaque == 0) {
+                rgb[i] = 0;
+                alpha[i] = 0;
+                continue;
+            }
+            rgb[i] = static_cast<uint16_t>(((r / opaque) << 11) | ((g / opaque) << 5) | (b / opaque));
+            alpha[i] = static_cast<uint8_t>(opaque * 255 / area);
+        }
+    }
+    memset(&t.dsc, 0, sizeof(t.dsc));
+    t.dsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    t.dsc.header.cf = LV_COLOR_FORMAT_RGB565A8;
+    t.dsc.header.w = w;
+    t.dsc.header.h = h;
+    t.dsc.header.stride = w * 2;
+    t.dsc.data_size = static_cast<uint32_t>(w) * h * 3;
+    t.dsc.data = t.data;
+    strlcpy(t.key, key, sizeof(t.key));
+    return &t.dsc;
+}
+
+// --- Shared row layouts ---------------------------------------------------------------------------------------
+
+// Width shared by all rows of a page: as wide as the circle allows at the outermost row, capped.
+static int rowWidthFor(size_t rows) {
+    const int outer = uiRowCenter(rows - 1, rows, kRowH, kRowGap, kRowBlockCy);
+    const int first = uiRowCenter(0, rows, kRowH, kRowGap, kRowBlockCy);
+    const int edgeCy = (outer > -first) ? outer : first;
+    // Rounded card corners are inset, so measure a little inside the card's top/bottom edge.
+    const int w = uiSafeWidth(edgeCy, kRowH - 12, 8);
+    return w < kRowMaxW ? w : kRowMaxW;
+}
+
+// A row inside a card: children laid out left to right, first and last pushed to the edges.
+static lv_obj_t *createRowLine(lv_obj_t *row, int x, int w, lv_align_t align, int y) {
+    lv_obj_t *line = uiBox(row, w, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(line, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(line, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(line, 10, LV_PART_MAIN);
+    lv_obj_align(line, align, x, y);
+    return line;
+}
+
+// Name label that takes the free space in a row line and truncates with "..." (never shrinks).
+static lv_obj_t *createGrowingName(lv_obj_t *line, const lv_font_t *font, const char *text) {
+    lv_obj_t *name = uiLabel(line, font, kUiTextPrimary, LV_TEXT_ALIGN_LEFT);
+    uiSingleLine(name);
+    lv_label_set_text(name, text);
+    lv_obj_set_flex_grow(name, 1);
+    return name;
+}
+
+struct PlayerLine {
+    const char *value;    // e.g. "£9.5m"
+    uint32_t valueColor;
+    const char *pill;     // e.g. "LIKELY RISE"
+    UiTone tone;
+    const char *detail;   // secondary, e.g. "+87%"
+};
+
+//  [kit]  Saka               £9.5m
+//         [LIKELY RISE]       +87%
+static void createPlayerRow(lv_obj_t *body, int cy, int w, const PlayerPrice &p, size_t kitSlot,
+                            const PlayerLine &line) {
+    lv_obj_t *row = uiListRow(body, cy, w, kRowH);
+    int contentX = 18;
+    if (const lv_image_dsc_t *kit = kitThumb(kitSlot, p.team, p.isGk, kKitRowFactor)) {
+        lv_obj_t *img = lv_image_create(row);
+        lv_image_set_src(img, kit);
+        lv_obj_align(img, LV_ALIGN_LEFT_MID, 12, 0);
+        contentX = 12 + static_cast<int>(kit->header.w) + 10;
+    }
+    const int contentW = w - contentX - kRowPadX;
+
+    lv_obj_t *top = createRowLine(row, contentX, contentW, LV_ALIGN_TOP_LEFT, 10);
+    createGrowingName(top, UI_FONT_NAME, p.name);
+    lv_obj_t *value = uiLabel(top, UI_FONT_NAME, line.valueColor, LV_TEXT_ALIGN_RIGHT);
+    lv_label_set_text(value, line.value);
+
+    lv_obj_t *bottom = createRowLine(row, contentX, contentW, LV_ALIGN_BOTTOM_LEFT, -10);
+    uiStatusPill(bottom, line.pill, line.tone);
+    lv_obj_t *detail = uiLabel(bottom, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_RIGHT);
+    lv_label_set_text(detail, line.detail);
+}
+
+// A page with one player gets the whole screen: kit, name, price, status.
+static void createPlayerSpotlight(lv_obj_t *body, const PlayerPrice &p, size_t kitSlot, const char *priceLine,
+                                  const PlayerLine &line) {
+    if (const lv_image_dsc_t *kit = kitThumb(kitSlot, p.team, p.isGk, kKitSpotlightFactor)) {
+        lv_obj_t *img = lv_image_create(body);
+        lv_image_set_src(img, kit);
+        lv_obj_align(img, LV_ALIGN_CENTER, 0, -74);
+    }
+    lv_obj_t *name = uiLabel(body, UI_FONT_VALUE, kUiTextPrimary);
+    lv_obj_set_width(name, uiSafeWidth(-14, 36));
+    uiSingleLine(name);
+    lv_label_set_text(name, p.name);
+    lv_obj_align(name, LV_ALIGN_CENTER, 0, -14);
+
+    lv_obj_t *price = uiLabel(body, UI_FONT_BODY, line.valueColor);
+    lv_label_set_text(price, priceLine);
+    lv_obj_align(price, LV_ALIGN_CENTER, 0, 20);
+
+    lv_obj_t *pill = uiStatusPill(body, line.pill, line.tone);
+    lv_obj_align(pill, LV_ALIGN_CENTER, 0, 56);
+
+    if (line.detail && line.detail[0]) {
+        lv_obj_t *detail = uiLabel(body, UI_FONT_META, kUiTextSecondary);
+        lv_label_set_text(detail, line.detail);
+        lv_obj_align(detail, LV_ALIGN_CENTER, 0, 92);
+    }
+}
+
+// Clamps the list page shown to the pages available; returns the first row index on it.
+static size_t currentRowPage(size_t rows, size_t &pagesOut) {
+    pagesOut = rowPages(rows);
+    if (carouselSubPage >= pagesOut) {
+        carouselSubPage = 0;
+    }
+    return carouselSubPage * kRowsPerPage;
+}
+
+// "Next update tonight 23:00 · 1/2"
+static void formatListSubtitle(char *out, size_t outLen, const char *text, size_t pages) {
+    if (pages > 1) {
+        snprintf(out, outLen, "%s%s%u/%u", text, text[0] ? "  " UI_DOT "  " : "",
+                 static_cast<unsigned>(carouselSubPage + 1), static_cast<unsigned>(pages));
+    } else {
+        strlcpy(out, text, outLen);
+    }
+}
+
+// --- Rank (home) page -----------------------------------------------------------------------------------------
+//        OVERALL RANK
+//          538,544
+//         [▲ 54,201]
+//     GW5    |   TOTAL
+//      51    |    355
+//      ● Updated 2m ago
+static void createHomeScreen() {
+    lv_obj_t *s = ui.screenIdle;
+    uiScreenHeader(s, "OVERALL RANK");
+
+    ui.idleRankValue = uiLabel(s, UI_FONT_HERO, kUiTextPrimary);
+    uiNumberInit(ui.idleRankValue);
+    lv_label_set_text(ui.idleRankValue, "--");
+    lv_obj_align(ui.idleRankValue, LV_ALIGN_CENTER, 0, -84);
+
+    ui.idleRankMove = uiStatusPill(s, "", UiTone::Neutral, UI_FONT_NAME);
+    lv_obj_align(ui.idleRankMove, LV_ALIGN_CENTER, 0, -30);
+    lv_obj_add_flag(ui.idleRankMove, LV_OBJ_FLAG_HIDDEN);
+
+    static constexpr int kColumnX = 76;
+    lv_obj_t *divider = uiBox(s, 1, 48);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(kUiSurfaceRaised), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_align(divider, LV_ALIGN_CENTER, 0, 36);
+
+    ui.idleGwLabel = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_set_style_text_letter_space(ui.idleGwLabel, 1, LV_PART_MAIN);
+    lv_label_set_text(ui.idleGwLabel, "GW");
+    lv_obj_align(ui.idleGwLabel, LV_ALIGN_CENTER, -kColumnX, 20);
+    lv_obj_t *totalLabel = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_set_style_text_letter_space(totalLabel, 1, LV_PART_MAIN);
+    lv_label_set_text(totalLabel, "TOTAL");
+    lv_obj_align(totalLabel, LV_ALIGN_CENTER, kColumnX, 20);
+
+    ui.idleGwPoints = uiLabel(s, UI_FONT_VALUE, kUiTextPrimary);
+    uiNumberInit(ui.idleGwPoints);
+    lv_label_set_text(ui.idleGwPoints, "--");
+    lv_obj_align(ui.idleGwPoints, LV_ALIGN_CENTER, -kColumnX, 50);
+    ui.idleTotalPoints = uiLabel(s, UI_FONT_VALUE, kUiTextPrimary);
+    uiNumberInit(ui.idleTotalPoints);
+    lv_label_set_text(ui.idleTotalPoints, "--");
+    lv_obj_align(ui.idleTotalPoints, LV_ALIGN_CENTER, kColumnX, 50);
+
+    lv_obj_t *status = uiBox(s, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(status, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(status, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(status, 8, LV_PART_MAIN);
+    lv_obj_align(status, LV_ALIGN_CENTER, 0, 112);
+    ui.idleStatusDot = uiDot(status, 8, kUiAccent);
+    ui.statusLabel = uiLabel(status, UI_FONT_META, kUiTextSecondary);
+    lv_label_set_text(ui.statusLabel, "");
+
+    ui.idleDots = uiBox(s, kUiScreenSize, kUiScreenSize);
+    lv_obj_set_pos(ui.idleDots, 0, 0);
+}
+
+// "Updated 5m ago" after a successful poll; otherwise fplTask's status (connecting, fetch failed, ...).
+static void formatHomeStatus(const SharedUiState &state, char *out, size_t outLen, uint32_t &dotColor) {
+    if (strcmp(state.statusText, kStatusFplUpdated) != 0 || state.lastApiUpdateMs == 0) {
+        strlcpy(out, state.statusText, outLen);
+        dotColor = state.statusColor;
+        return;
+    }
+    dotColor = kUiAccent;
+    const uint32_t minutes = (millis() - state.lastApiUpdateMs) / 60000U;
+    if (minutes < 1) {
+        strlcpy(out, "Updated now", outLen);
+    } else if (minutes < 60) {
+        snprintf(out, outLen, "Updated %um ago", static_cast<unsigned>(minutes));
+    } else {
+        snprintf(out, outLen, "Updated %uh ago", static_cast<unsigned>(minutes / 60));
+    }
+}
+
+// Called every UI loop; the widgets only redraw when something they show changes.
+static void updateHomeScreen(const SharedUiState &state) {
+    if (!ui.idleRankValue) {
+        return;
+    }
+    char buf[48];
+    if (state.hasRankData) {
+        uiNumberSet(ui.idleRankValue, state.overallRank, true);
+        char diffBuf[24];
+        formatNumberWithCommas(state.rankDiff < 0 ? -state.rankDiff : state.rankDiff, diffBuf, sizeof(diffBuf));
+        if (state.rankDiff > 0) {
+            snprintf(buf, sizeof(buf), UI_SYM_UP "  %s", diffBuf);
+            uiStatusPillSet(ui.idleRankMove, buf, UiTone::Positive);
+        } else if (state.rankDiff < 0) {
+            snprintf(buf, sizeof(buf), UI_SYM_DOWN "  %s", diffBuf);
+            uiStatusPillSet(ui.idleRankMove, buf, UiTone::Negative);
+        } else {
+            uiStatusPillSet(ui.idleRankMove, UI_DASH "  no change", UiTone::Neutral);
+        }
+        lv_obj_remove_flag(ui.idleRankMove, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        uiNumberClear(ui.idleRankValue, "--");
+        lv_obj_add_flag(ui.idleRankMove, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    if (state.currentGw > 0) {
+        snprintf(buf, sizeof(buf), "GW%d", state.currentGw);
+    } else {
+        strlcpy(buf, "GW", sizeof(buf));
+    }
+    uiSetText(ui.idleGwLabel, buf);
+    if (state.hasGwPoints) {
+        uiNumberSet(ui.idleGwPoints, state.gwPoints, true);
+    } else {
+        uiNumberClear(ui.idleGwPoints, "--");
+    }
+    if (state.hasTotalPoints) {
+        uiNumberSet(ui.idleTotalPoints, state.totalPoints, true);
+    } else {
+        uiNumberClear(ui.idleTotalPoints, "--");
+    }
+
+    uint32_t dotColor = kUiAccent;
+    formatHomeStatus(state, buf, sizeof(buf), dotColor);
+    uiSetText(ui.statusLabel, buf);
+    static uint32_t shownDotColor = 0;
+    if (dotColor != shownDotColor) {
+        lv_obj_set_style_bg_color(ui.idleStatusDot, lv_color_hex(dotColor), LV_PART_MAIN);
+        shownDotColor = dotColor;
+    }
+
+    // New data that changed something: a brief glow around the display edge.
+    static uint32_t seenUpdateMs = 0;
+    static bool seenData = false;
+    static int seenRank = 0;
+    static int seenGwPoints = 0;
+    static int seenTotal = 0;
+    if (state.lastApiUpdateMs != seenUpdateMs) {
+        const bool changed = seenData && (state.overallRank != seenRank || state.gwPoints != seenGwPoints ||
+                                          state.totalPoints != seenTotal);
+        if (changed && currentMode == UiMode::Idle) {
+            uiPulseRing();
+        }
+        seenUpdateMs = state.lastApiUpdateMs;
+        seenData = state.hasRankData;
+        seenRank = state.overallRank;
+        seenGwPoints = state.gwPoints;
+        seenTotal = state.totalPoints;
+    }
+}
+
+static void renderHomeDots() {
+    if (ui.idleDots) {
+        lv_obj_clean(ui.idleDots);
+        addCarouselDots(ui.idleDots);
+    }
+}
+
+// --- Rank history ---------------------------------------------------------------------------------------------
+static void renderRankGraphPage(bool entering) {
     lv_obj_t *body = ui.idleGraphBody;
     if (!body) {
         return;
@@ -3028,37 +3501,38 @@ static void renderRankGraphPage() {
     const size_t first = rankGraphFirstIndex();
     const size_t n = h.count > first ? h.count - first : 0;
 
-    char subtitle[32];
+    char buf[40];
     if (idleUiSettings.rankGraphGameweeks == 0) {
-        strlcpy(subtitle, "all gameweeks", sizeof(subtitle));
+        strlcpy(buf, "All gameweeks", sizeof(buf));
     } else {
-        snprintf(subtitle, sizeof(subtitle), "last %u gameweeks", static_cast<unsigned>(n));
+        snprintf(buf, sizeof(buf), "Last %u gameweeks", static_cast<unsigned>(n));
     }
-    createIdleTitle(body, "RANK HISTORY", subtitle);
+    const bool live = inLiveCarousel();  // the last point is the live overall rank (publishIdleScreensFromCache)
+    uiScreenHeader(body, live ? "LIVE RANK" : "RANK HISTORY", buf);
+    addCarouselDots(body);
     if (n < 2) {
-        createIdleMessage(body, "Not enough gameweeks yet");
+        uiEmptyState(body, UI_SYM_ARROW, "Not enough data yet", "The graph starts after two gameweeks",
+                     UiTone::Neutral);
         return;
     }
 
-    // Y axis: best (lowest) rank at the top, 10% margin on both ends.
+    // Y axis: best (lowest) rank at the top, a small margin at both ends.
     int best = h.overallRank[first];
     int worst = h.overallRank[first];
     for (size_t i = first; i < h.count; ++i) {
         best = h.overallRank[i] < best ? h.overallRank[i] : best;
         worst = h.overallRank[i] > worst ? h.overallRank[i] : worst;
     }
-    int axisTop = static_cast<int>(best * 0.9);
-    if (axisTop < 1) {
-        axisTop = 1;
-    }
-    const int axisBottom = static_cast<int>(static_cast<int64_t>(worst) * 11 / 10 + 1);
+    const int64_t margin = (static_cast<int64_t>(worst) - best) / 12 + 1;
+    const int64_t axisTop = best - margin;
+    const int64_t axisBottom = worst + margin;
     const int64_t span = axisBottom - axisTop;
 
-    static constexpr int kChartX = 100;
-    static constexpr int kChartY = 118;
-    static constexpr int kChartW = 256;
-    static constexpr int kChartH = 160;
-    static constexpr int kChartPad = 6;  // room for the end points
+    static constexpr int kChartX = 56;
+    static constexpr int kChartY = 98;
+    static constexpr int kChartW = 300;
+    static constexpr int kChartH = 134;
+    static constexpr int kChartPad = 4;
     // lv_chart maps values in int32 (value * height), so plot on a 0..10000 scale instead of raw ranks.
     static constexpr int32_t kScale = 10000;
 
@@ -3071,124 +3545,161 @@ static void renderRankGraphPage() {
     lv_obj_set_style_border_width(chart, 0, LV_PART_MAIN);
     lv_obj_set_style_radius(chart, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(chart, kChartPad, LV_PART_MAIN);
-    lv_obj_set_style_line_color(chart, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
-    lv_obj_set_style_line_width(chart, 1, LV_PART_MAIN);
-    lv_obj_set_style_line_width(chart, 3, LV_PART_ITEMS);
-    lv_obj_set_style_width(chart, 8, LV_PART_INDICATOR);
-    lv_obj_set_style_height(chart, 8, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(chart, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_line_width(chart, 4, LV_PART_ITEMS);
+    lv_obj_set_style_line_rounded(chart, true, LV_PART_ITEMS);
+    lv_obj_set_style_width(chart, 0, LV_PART_INDICATOR);
+    lv_obj_set_style_height(chart, 0, LV_PART_INDICATOR);
     lv_chart_set_type(chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_div_line_count(chart, 3, 0);
+    lv_chart_set_div_line_count(chart, 0, 0);
     lv_chart_set_point_count(chart, static_cast<uint32_t>(n));
     lv_chart_set_axis_range(chart, LV_CHART_AXIS_PRIMARY_Y, 0, kScale);
-    lv_chart_series_t *series = lv_chart_add_series(chart, lv_color_hex(kColorAccentCyan), LV_CHART_AXIS_PRIMARY_Y);
+    lv_chart_series_t *series = lv_chart_add_series(chart, lv_color_hex(kUiAccent), LV_CHART_AXIS_PRIMARY_Y);
+    int32_t firstValue = 0;
+    int32_t lastValue = 0;
     for (size_t i = 0; i < n; ++i) {
         const int64_t fromBottom = axisBottom - h.overallRank[first + i];
-        lv_chart_set_value_by_id(chart, series, static_cast<uint32_t>(i), static_cast<int32_t>(fromBottom * kScale / span));
+        const int32_t value = static_cast<int32_t>(fromBottom * kScale / span);
+        lv_chart_set_value_by_id(chart, series, static_cast<uint32_t>(i), value);
+        firstValue = i == 0 ? value : firstValue;
+        lastValue = value;
     }
     lv_chart_refresh(chart);
 
-    // Y labels at the three division lines.
+    // Start and end markers: the end point is the one that matters.
     const int contentH = kChartH - 2 * kChartPad;
-    const int axisValues[3] = {axisTop, axisTop + static_cast<int>(span / 2), axisBottom};
-    char buf[24];
-    for (int i = 0; i < 3; ++i) {
-        formatRankCompact(axisValues[i], buf, sizeof(buf));
-        lv_obj_t *label = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_RIGHT);
-        lv_obj_set_width(label, 56);
-        lv_label_set_text(label, buf);
-        lv_obj_set_pos(label, kChartX - 60, kChartY + kChartPad + (contentH * i) / 2 - 8);
-    }
+    auto pointY = [&](int32_t value) {
+        return kChartY + kChartPad + contentH - static_cast<int>(static_cast<int64_t>(value) * contentH / kScale);
+    };
+    lv_obj_t *startDot = uiDot(body, 8, kUiTextSecondary);
+    lv_obj_set_pos(startDot, kChartX + kChartPad - 4, pointY(firstValue) - 4);
+    lv_obj_t *endDot = uiDot(body, 16, kUiAccent);
+    lv_obj_set_style_border_color(endDot, lv_color_hex(kUiBg), LV_PART_MAIN);
+    lv_obj_set_style_border_width(endDot, 3, LV_PART_MAIN);
+    lv_obj_set_style_shadow_color(endDot, lv_color_hex(kUiAccent), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(endDot, 18, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(endDot, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_pos(endDot, kChartX + kChartW - kChartPad - 8, pointY(lastValue) - 8);
 
-    // X labels: every GW when they fit, otherwise first, middle and last.
-    const int contentW = kChartW - 2 * kChartPad;
-    const bool labelAll = n <= 10;
-    for (size_t i = 0; i < n; ++i) {
-        if (!labelAll && i != 0 && i != n - 1 && i != (n - 1) / 2) {
-            continue;
-        }
-        snprintf(buf, sizeof(buf), n <= 5 || !labelAll ? "GW%d" : "%d", h.gw[first + i]);
-        lv_obj_t *label = createLabel(body, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-        lv_obj_set_width(label, 44);
-        lv_label_set_text(label, buf);
-        const int x = kChartX + kChartPad + static_cast<int>((contentW * static_cast<int>(i)) / static_cast<int>(n - 1));
-        lv_obj_set_pos(label, x - 22, kChartY + kChartH + 4);
-    }
+    // Only the ends of the time axis are labelled.
+    lv_obj_t *startGw = uiLabel(body, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_LEFT);
+    snprintf(buf, sizeof(buf), "GW%d", h.gw[first]);
+    lv_label_set_text(startGw, buf);
+    lv_obj_set_pos(startGw, kChartX, kChartY + kChartH + 8);
+    lv_obj_t *endGw = uiLabel(body, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_RIGHT);
+    snprintf(buf, sizeof(buf), live ? "GW%d live" : "GW%d", h.gw[h.count - 1]);
+    lv_label_set_text(endGw, buf);
+    lv_obj_align(endGw, LV_ALIGN_TOP_RIGHT, -(kUiScreenSize - kChartX - kChartW), kChartY + kChartH + 8);
 
-    // Latest rank with the change from the previous gameweek on the graph.
     const int latest = h.overallRank[h.count - 1];
-    const int previous = h.overallRank[h.count - 2];
-    char rankBuf[24];
-    formatNumberWithCommas(latest, rankBuf, sizeof(rankBuf));
-    snprintf(buf, sizeof(buf), "GW%d  %s", h.gw[h.count - 1], rankBuf);
-    lv_obj_t *footer = createLabel(body, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(footer, buf);
-    lv_obj_align(footer, LV_ALIGN_CENTER, -10, 118);
-    lv_obj_t *arrow = createLabel(body, kFontBody,
-                                  latest < previous ? kColorAccentGreen :
-                                  (latest > previous ? kColorAccentRed : kColorTextSecondary),
-                                  LV_TEXT_ALIGN_LEFT);
-    lv_label_set_text(arrow, latest < previous ? LV_SYMBOL_UP : (latest > previous ? LV_SYMBOL_DOWN : "-"));
-    lv_obj_align_to(arrow, footer, LV_ALIGN_OUT_RIGHT_MID, 8, 0);
+    const int start = h.overallRank[first];
+    lv_obj_t *rank = uiLabel(body, UI_FONT_VALUE, kUiTextPrimary);
+    formatNumberWithCommas(latest, buf, sizeof(buf));
+    lv_label_set_text(rank, buf);
+    lv_obj_align(rank, LV_ALIGN_CENTER, 0, 80);
+
+    char change[16];
+    formatRankCompact(start > latest ? start - latest : latest - start, change, sizeof(change));
+    if (latest < start) {
+        snprintf(buf, sizeof(buf), UI_SYM_UP " %s since GW%d", change, h.gw[first]);
+    } else if (latest > start) {
+        snprintf(buf, sizeof(buf), UI_SYM_DOWN " %s since GW%d", change, h.gw[first]);
+    } else {
+        snprintf(buf, sizeof(buf), "Level since GW%d", h.gw[first]);
+    }
+    lv_obj_t *pill = uiStatusPill(body, buf,
+                                  latest < start ? UiTone::Positive : (latest > start ? UiTone::Negative : UiTone::Neutral));
+    lv_obj_align(pill, LV_ALIGN_CENTER, 0, 118);
+
+    if (entering) {
+        // Draw the line left to right once the page has slid in.
+        uiRevealLeftToRight(body, kChartX - 14, kChartY - 14, kChartW + 30, kChartH + 20, 700, kUiMotionMs);
+    }
 }
 
+// --- Price changes (my squad) ---------------------------------------------------------------------------------
 static void renderPricesPage() {
     lv_obj_t *body = ui.idlePricesBody;
     if (!body) {
         return;
     }
     lv_obj_clean(body);
-    char subtitle[40];
-    char nextUpdate[24];
-    formatNextPriceUpdate(nextUpdate, sizeof(nextUpdate));
-    snprintf(subtitle, sizeof(subtitle), "my squad%s%s", nextUpdate[0] ? " - " : "", nextUpdate);
-    createIdleTitle(body, "PRICE CHANGES", subtitle);
-
-    const PriceData &prices = idleUiData->prices;
     const PlayerPrice *changes[16];
-    size_t changeCount = 0;
-    for (size_t i = 0; i < prices.squadCount; ++i) {
-        if (expectedPriceDirection(prices.squad[i]) != 0) {
-            changes[changeCount++] = &prices.squad[i];
-        }
+    const size_t total = squadPriceChanges(changes, 16);
+    size_t pages = 1;
+    const size_t firstRow = currentRowPage(total, pages);
+
+    bool tonight = false;
+    char when[24];
+    formatNextPriceUpdate(when, sizeof(when), &tonight);
+    char text[40];
+    if (when[0]) {
+        snprintf(text, sizeof(text), "Next update %s", when);
+    } else {
+        strlcpy(text, "My squad", sizeof(text));
     }
-    if (changeCount == 0) {
-        createIdleMessage(body, "No expected\nprice changes");
+    char subtitle[56];
+    formatListSubtitle(subtitle, sizeof(subtitle), text, pages);
+    uiScreenHeader(body, "PRICE CHANGES", subtitle);
+    addCarouselDots(body);
+
+    if (total == 0) {
+        uiEmptyState(body, UI_SYM_CHECK, "No changes expected",
+                     tonight ? "Your squad looks safe tonight" : "Your squad looks safe for now");
         return;
     }
-    // Rises first, then falls; strongest projection first within each.
-    for (size_t i = 1; i < changeCount; ++i) {
-        for (size_t j = i; j > 0; --j) {
-            const PlayerPrice *a = changes[j - 1];
-            const PlayerPrice *b = changes[j];
-            if (b->projectedPct > a->projectedPct) {
-                changes[j - 1] = b;
-                changes[j] = a;
-            }
+
+    char now[32];
+    char next[32];
+    char detail[40];
+    if (total == 1) {
+        const PlayerPrice &p = *changes[0];
+        const int dir = expectedPriceDirection(p);
+        formatPrice(p.nowCost, now, sizeof(now));
+        formatPrice(p.nowCost + dir, next, sizeof(next));
+        char priceLine[80];
+        snprintf(priceLine, sizeof(priceLine), "%s  " UI_SYM_ARROW "  %s", now, next);
+        if (when[0]) {
+            snprintf(detail, sizeof(detail), "Expected %s", when);
+        } else {
+            detail[0] = '\0';
         }
+        const PlayerLine line = {"", uiToneColor(dir > 0 ? UiTone::Positive : UiTone::Negative),
+                                 dir > 0 ? "LIKELY RISE" : "LIKELY FALL",
+                                 dir > 0 ? UiTone::Positive : UiTone::Negative, detail};
+        createPlayerSpotlight(body, p, kPricesKitSlot, priceLine, line);
+        return;
     }
 
-    static constexpr int kRowH = 38;
-    const size_t shown = changeCount > kPriceRowsMax ? kPriceRowsMax - 1 : changeCount;
-    const size_t rows = changeCount > kPriceRowsMax ? kPriceRowsMax : changeCount;
-    char buf[32];
-    for (size_t i = 0; i < shown; ++i) {
-        const PlayerPrice &p = *changes[i];
+    const size_t rows = (total - firstRow) < kRowsPerPage ? (total - firstRow) : kRowsPerPage;
+    const int w = rowWidthFor(rows);
+    for (size_t i = 0; i < rows; ++i) {
+        const PlayerPrice &p = *changes[firstRow + i];
         const int dir = expectedPriceDirection(p);
-        lv_obj_t *row = createIdleRow(body, idleRowY(i, rows, kRowH), kRowH);
-        createRowLabel(row, kFontBody, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 170, p.name);
-        char priceBuf[12];
-        formatPrice(p.nowCost, priceBuf, sizeof(priceBuf));
-        snprintf(buf, sizeof(buf), "%s %s", priceBuf, dir > 0 ? LV_SYMBOL_UP : LV_SYMBOL_DOWN);
-        createRowLabel(row, kFontBody, dir > 0 ? kColorAccentGreen : kColorAccentRed, LV_ALIGN_RIGHT_MID, -8, 0, buf);
+        const UiTone tone = dir > 0 ? UiTone::Positive : UiTone::Negative;
+        formatPrice(p.nowCost + dir, next, sizeof(next));
+        formatPrice(p.nowCost, now, sizeof(now));
+        snprintf(detail, sizeof(detail), "from %s", now);
+        const PlayerLine line = {next, uiToneColor(tone), dir > 0 ? UI_SYM_UP " RISE" : UI_SYM_DOWN " FALL", tone,
+                                 detail};
+        createPlayerRow(body, uiRowCenter(i, rows, kRowH, kRowGap, kRowBlockCy), w, p, kPricesKitSlot + i, line);
     }
-    if (shown < changeCount) {
-        lv_obj_t *row = createIdleRow(body, idleRowY(shown, rows, kRowH), kRowH);
-        lv_obj_set_style_border_width(row, 0, LV_PART_MAIN);
-        snprintf(buf, sizeof(buf), "+%u more", static_cast<unsigned>(changeCount - shown));
-        lv_obj_t *more = createLabel(row, kFontCaption, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-        lv_label_set_text(more, buf);
-        lv_obj_center(more);
+}
+
+// --- Watchlist ------------------------------------------------------------------------------------------------
+static void watchStatus(const PlayerPrice &p, const char *&pill, UiTone &tone) {
+    const int dir = expectedPriceDirection(p);
+    if (p.locked) {
+        pill = "LOCKED";
+        tone = UiTone::Neutral;
+    } else if (dir > 0) {
+        pill = "LIKELY RISE";
+        tone = UiTone::Positive;
+    } else if (dir < 0) {
+        pill = "LIKELY FALL";
+        tone = UiTone::Negative;
+    } else {
+        pill = "NO CHANGE";
+        tone = UiTone::Neutral;
     }
 }
 
@@ -3198,42 +3709,64 @@ static void renderWatchlistPage() {
         return;
     }
     lv_obj_clean(body);
-    char nextUpdate[24];
-    formatNextPriceUpdate(nextUpdate, sizeof(nextUpdate));
-    createIdleTitle(body, "WATCHLIST", nextUpdate);
-
     const PriceData &prices = idleUiData->prices;
-    const size_t rows = prices.watchCount;
-    const int rowH = rows > 6 ? 28 : 38;
-    const lv_font_t *nameFont = rows > 6 ? &lv_font_montserrat_16 : kFontCaption;
-    char buf[32];
-    for (size_t i = 0; i < rows; ++i) {
-        const PlayerPrice &p = prices.watch[i];
-        const int dir = expectedPriceDirection(p);
-        lv_obj_t *row = createIdleRow(body, idleRowY(i, rows, rowH), rowH);
-        createRowLabel(row, nameFont, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 118, p.name);
+    const size_t total = prices.watchCount;
+    size_t pages = 1;
+    const size_t firstRow = currentRowPage(total, pages);
 
-        // Price and progress toward the next change, e.g. "9.5m +50%".
-        char priceBuf[12];
-        formatPrice(p.nowCost, priceBuf, sizeof(priceBuf));
-        snprintf(buf, sizeof(buf), "%s %+d%%", priceBuf, p.projectedPct / 10);
-        createRowLabel(row, kFontMicro, kColorTextSecondary, LV_ALIGN_LEFT_MID, 132, 0, buf);
+    char when[24];
+    formatNextPriceUpdate(when, sizeof(when));
+    char text[40];
+    if (when[0]) {
+        snprintf(text, sizeof(text), "Next update %s", when);
+    } else {
+        text[0] = '\0';
+    }
+    char subtitle[56];
+    formatListSubtitle(subtitle, sizeof(subtitle), text, pages);
+    uiScreenHeader(body, "WATCHLIST", subtitle);
+    addCarouselDots(body);
 
-        uint32_t color = kColorTextSecondary;
-        const char *status = "No change";
+    char price[32];
+    char detail[40];
+    const char *pill = "";
+    UiTone tone = UiTone::Neutral;
+    if (total == 1) {
+        const PlayerPrice &p = prices.watch[0];
+        watchStatus(p, pill, tone);
+        formatPrice(p.nowCost, price, sizeof(price));
+        const int pct = (p.projectedPct < 0 ? -p.projectedPct : p.projectedPct) / 10;
         if (p.locked) {
-            status = "Locked";
-        } else if (dir > 0) {
-            status = LV_SYMBOL_UP " Rise";
-            color = kColorAccentGreen;
-        } else if (dir < 0) {
-            status = LV_SYMBOL_DOWN " Fall";
-            color = kColorAccentRed;
+            strlcpy(detail, "Price locked until the next update", sizeof(detail));
+        } else if (pct == 0) {
+            strlcpy(detail, "No transfer pressure", sizeof(detail));
+        } else {
+            snprintf(detail, sizeof(detail), "%d%% of the way to a %s", pct, p.projectedPct > 0 ? "rise" : "fall");
         }
-        createRowLabel(row, &lv_font_montserrat_16, color, LV_ALIGN_RIGHT_MID, -8, 0, status);
+        const PlayerLine line = {"", kUiTextPrimary, pill, tone, detail};
+        createPlayerSpotlight(body, p, kWatchKitSlot, price, line);
+        return;
+    }
+
+    const size_t rows = (total - firstRow) < kRowsPerPage ? (total - firstRow) : kRowsPerPage;
+    const int w = rowWidthFor(rows);
+    for (size_t i = 0; i < rows; ++i) {
+        const PlayerPrice &p = prices.watch[firstRow + i];
+        watchStatus(p, pill, tone);
+        formatPrice(p.nowCost, price, sizeof(price));
+        if (p.locked) {
+            detail[0] = '\0';
+        } else {
+            snprintf(detail, sizeof(detail), "%+d%%", p.projectedPct / 10);
+        }
+        const PlayerLine line = {price, kUiTextPrimary, pill, tone, detail};
+        createPlayerRow(body, uiRowCenter(i, rows, kRowH, kRowGap, kRowBlockCy), w, p, kWatchKitSlot + i, line);
     }
 }
 
+// --- Mini leagues ---------------------------------------------------------------------------------------------
+//  Arsenalvision
+//  #323 of 1,204          [▲ 54]
 static void renderLeaguesPage() {
     lv_obj_t *body = ui.idleLeaguesBody;
     if (!body) {
@@ -3242,99 +3775,235 @@ static void renderLeaguesPage() {
     lv_obj_clean(body);
     const MiniLeague *leagues[kMaxMiniLeagues];
     const size_t total = visibleLeagues(leagues, kMaxMiniLeagues);
-    const size_t pages = (total + kLeaguesPerPage - 1) / kLeaguesPerPage;
-    if (idleLeaguePage >= pages) {
-        idleLeaguePage = 0;
-    }
+    size_t pages = 1;
+    const size_t firstRow = currentRowPage(total, pages);
 
-    char subtitle[24] = "";
-    if (pages > 1) {
-        snprintf(subtitle, sizeof(subtitle), "%u / %u", static_cast<unsigned>(idleLeaguePage + 1),
-                 static_cast<unsigned>(pages));
-    }
-    createIdleTitle(body, "MINI LEAGUES", subtitle);
+    // During a gameweek FPL updates the league ranks as the scores come in, so this is the live table.
+    char subtitle[24];
+    formatListSubtitle(subtitle, sizeof(subtitle), inLiveCarousel() ? "Live" : "", pages);
+    uiScreenHeader(body, "MINI LEAGUES", subtitle);
+    addCarouselDots(body);
     if (total == 0) {
-        createIdleMessage(body, "No mini leagues");
+        uiEmptyState(body, UI_SYM_CHECK, "No mini leagues", "Join a league on the FPL site", UiTone::Neutral);
         return;
     }
 
-    static constexpr int kRowH = 42;
-    const size_t first = idleLeaguePage * kLeaguesPerPage;
-    const size_t rows = (total - first) < kLeaguesPerPage ? (total - first) : kLeaguesPerPage;
-    char buf[24];
+    const size_t rows = (total - firstRow) < kRowsPerPage ? (total - firstRow) : kRowsPerPage;
+    const int w = rowWidthFor(rows);
+    char buf[32];
     for (size_t i = 0; i < rows; ++i) {
-        const MiniLeague &lg = *leagues[first + i];
-        lv_obj_t *row = createIdleRow(body, idleRowY(i, kLeaguesPerPage, kRowH), kRowH);
-        createRowLabel(row, kFontCaption, kColorTextPrimary, LV_ALIGN_LEFT_MID, 8, 160, lg.name);
+        const MiniLeague &lg = *leagues[firstRow + i];
+        lv_obj_t *row = uiListRow(body, uiRowCenter(i, rows, kRowH, kRowGap, kRowBlockCy), w, kRowH);
 
+        lv_obj_t *name = uiLabel(row, UI_FONT_BODY, kUiTextSecondary, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_width(name, w - 2 * 18);
+        uiSingleLine(name);
+        lv_label_set_text(name, lg.name);
+        lv_obj_align(name, LV_ALIGN_TOP_LEFT, 18, 9);
+
+        lv_obj_t *line = createRowLine(row, 18, w - 18 - kRowPadX, LV_ALIGN_BOTTOM_LEFT, -7);
+        lv_obj_t *rankGroup = uiBox(line, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(rankGroup, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(rankGroup, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+        lv_obj_set_style_pad_column(rankGroup, 6, LV_PART_MAIN);
+        lv_obj_t *rank = uiLabel(rankGroup, UI_FONT_VALUE, kUiTextPrimary, LV_TEXT_ALIGN_LEFT);
         char rankBuf[16];
         formatNumberWithCommas(lg.rank, rankBuf, sizeof(rankBuf));
         snprintf(buf, sizeof(buf), "#%s", rankBuf);
-        createRowLabel(row, kFontCaption, kColorTextPrimary, LV_ALIGN_RIGHT_MID, -70, 0, buf);
+        lv_label_set_text(rank, buf);
+        if (lg.size > 0) {
+            lv_obj_t *of = uiLabel(rankGroup, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_LEFT);
+            lv_obj_set_style_pad_bottom(of, 5, LV_PART_MAIN);
+            formatNumberWithCommas(lg.size, rankBuf, sizeof(rankBuf));
+            snprintf(buf, sizeof(buf), "of %s", rankBuf);
+            lv_label_set_text(of, buf);
+        }
 
         // Movement since the end of the previous gameweek (positive = climbed).
         const int moved = lg.lastRank > 0 ? lg.lastRank - lg.rank : 0;
-        uint32_t color = kColorTextSecondary;
         if (moved > 0) {
-            snprintf(buf, sizeof(buf), LV_SYMBOL_UP "%d", moved);
-            color = kColorAccentGreen;
+            snprintf(buf, sizeof(buf), UI_SYM_UP " %d", moved);
+            uiStatusPill(line, buf, UiTone::Positive);
         } else if (moved < 0) {
-            snprintf(buf, sizeof(buf), LV_SYMBOL_DOWN "%d", -moved);
-            color = kColorAccentRed;
+            snprintf(buf, sizeof(buf), UI_SYM_DOWN " %d", -moved);
+            uiStatusPill(line, buf, UiTone::Negative);
         } else {
-            strlcpy(buf, "-", sizeof(buf));
+            uiStatusPill(line, UI_DASH, UiTone::Neutral);
         }
-        lv_obj_t *move = createRowLabel(row, &lv_font_montserrat_16, color, LV_ALIGN_RIGHT_MID, -8, 60, buf);
-        lv_obj_set_style_text_align(move, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
     }
 }
 
-static void renderIdlePage(IdlePage page) {
+// --- Carousel control -----------------------------------------------------------------------------------------
+// `entering` = the page (or its next list screen) is just being shown, so its entrance animation plays.
+static void renderIdlePage(IdlePage page, bool entering) {
     switch (page) {
-        case IdlePage::Rank: break;  // updated continuously by updateModeUi
-        case IdlePage::RankGraph: renderRankGraphPage(); break;
+        case IdlePage::Rank: renderHomeDots(); break;  // the numbers are updated continuously by updateHomeScreen
+        case IdlePage::RankGraph: renderRankGraphPage(entering); break;
         case IdlePage::Prices: renderPricesPage(); break;
         case IdlePage::Watchlist: renderWatchlistPage(); break;
         case IdlePage::Leagues: renderLeaguesPage(); break;
     }
 }
 
-static void showIdlePage(IdlePage page) {
+// Showing a page (or another screen of a list page) restarts the carousel timer, so every screen gets a full
+// interval however it was reached.
+static void showIdlePage(IdlePage page, bool forward = true) {
     idlePage = page;
     idlePageShownMs = millis();
-    renderIdlePage(page);
+    renderIdlePage(page, true);
     lv_obj_t *screen = idlePageScreen(page);
     if (currentMode == UiMode::Idle && screen && lv_screen_active() != screen) {
-        lv_screen_load_anim(screen, LV_SCR_LOAD_ANIM_MOVE_LEFT, 300, 0, false);
+        lv_screen_load_anim(screen, forward ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT, kUiMotionMs,
+                            0, false);
     }
 }
 
-static void advanceIdlePage() {
-    if (idlePage == IdlePage::Leagues && idleLeaguePage + 1 < leaguePageCount()) {
-        ++idleLeaguePage;
+// Next (or previous) screen: the list pages step through their screens of rows first. Going back lands on the
+// last screen of the previous page.
+static void stepIdlePage(bool forward) {
+    if (forward ? carouselSubPage + 1 < idleSubPageCount(idlePage) : carouselSubPage > 0) {
+        carouselSubPage = forward ? carouselSubPage + 1 : carouselSubPage - 1;
         idlePageShownMs = millis();
-        renderLeaguesPage();
+        renderIdlePage(idlePage, true);
+        uiFadeIn(idlePageBody(idlePage));
         return;
     }
     IdlePage next = idlePage;
     for (uint8_t i = 0; i < kIdlePageCount; ++i) {
-        next = static_cast<IdlePage>((static_cast<uint8_t>(next) + 1) % kIdlePageCount);
+        next = static_cast<IdlePage>((static_cast<uint8_t>(next) + (forward ? 1 : kIdlePageCount - 1)) % kIdlePageCount);
         if (idlePageAvailable(next)) {
             break;
         }
     }
-    idleLeaguePage = 0;
-    showIdlePage(next);
+    carouselSubPage = forward ? 0 : idleSubPageCount(next) - 1;
+    showIdlePage(next, forward);
 }
 
-static void idleTapEventCb(lv_event_t *) {
-    if (currentMode == UiMode::Idle) {
-        advanceIdlePage();
+static void advanceIdlePage() {
+    stepIdlePage(true);
+}
+
+// --- Live carousel control ------------------------------------------------------------------------------------
+static lv_obj_t *livePageList(LivePage page) {
+    switch (page) {
+        case LivePage::Events: return ui.eventsList;
+        case LivePage::Squad: return ui.squadList;
+        default: return nullptr;
     }
 }
 
-// Called from uiTask every loop: picks up new data/settings and advances the carousel on its timer.
-static void serviceIdleCarousel() {
+static void renderDots(lv_obj_t *container) {
+    if (container) {
+        lv_obj_clean(container);
+        addCarouselDots(container);
+    }
+}
+
+// The score and the two lists are kept up to date by updateModeUi; this redraws their dots (and, when `entering`,
+// rebuilds the list so it starts from the top). The leagues and graph pages are rebuilt from idleUiData.
+static void renderLivePage(LivePage page, bool entering) {
+    switch (page) {
+        case LivePage::Main: renderDots(ui.liveDots); break;
+        case LivePage::Events:
+            renderDots(ui.eventsDots);
+            if (entering) {
+                renderedEventsVersion = 0;
+            }
+            break;
+        case LivePage::Squad:
+            renderDots(ui.squadDots);
+            if (entering) {
+                renderedSquadVersion = 0;
+            }
+            break;
+        case LivePage::Leagues: renderLeaguesPage(); break;
+        case LivePage::RankGraph: renderRankGraphPage(entering); break;
+    }
+}
+
+static void showLivePage(LivePage page, bool forward = true) {
+    livePage = page;
+    livePageShownMs = millis();
+    renderLivePage(page, true);
+    if (lv_obj_t *list = livePageList(page)) {
+        lv_obj_scroll_to_y(list, 0, LV_ANIM_OFF);
+    }
+    lv_obj_t *screen = livePageScreen(page);
+    if (currentMode == UiMode::Live && screen && lv_screen_active() != screen) {
+        lv_screen_load_anim(screen, forward ? LV_SCR_LOAD_ANIM_MOVE_LEFT : LV_SCR_LOAD_ANIM_MOVE_RIGHT, kUiMotionMs,
+                            0, false);
+    }
+}
+
+static size_t liveSubPageCount(LivePage page) {
+    return page == LivePage::Leagues ? idleSubPageCount(IdlePage::Leagues) : 1;
+}
+
+// As stepIdlePage. (The events and squad lists scroll rather than page.)
+static void stepLivePage(bool forward) {
+    if (forward ? carouselSubPage + 1 < liveSubPageCount(livePage) : carouselSubPage > 0) {
+        carouselSubPage = forward ? carouselSubPage + 1 : carouselSubPage - 1;
+        livePageShownMs = millis();
+        renderLivePage(livePage, true);
+        uiFadeIn(ui.idleLeaguesBody);
+        return;
+    }
+    LivePage next = livePage;
+    for (uint8_t i = 0; i < kLivePageCount; ++i) {
+        next = static_cast<LivePage>((static_cast<uint8_t>(next) + (forward ? 1 : kLivePageCount - 1)) % kLivePageCount);
+        if (livePageAvailable(next)) {
+            break;
+        }
+    }
+    carouselSubPage = forward ? 0 : liveSubPageCount(next) - 1;
+    showLivePage(next, forward);
+}
+
+static void advanceLivePage() {
+    stepLivePage(true);
+}
+
+// Tapping a carousel page (anywhere but a button): the left third goes back a screen, the rest goes forward.
+static void carouselTapEventCb(lv_event_t *) {
+    lv_indev_t *indev = lv_indev_active();
+    if (!indev || !isTap()) {
+        return;
+    }
+    lv_point_t p;
+    lv_indev_get_point(indev, &p);
+    const bool forward = p.x >= kUiScreenSize / 3;
+    if (currentMode == UiMode::Idle) {
+        stepIdlePage(forward);
+    } else if (currentMode == UiMode::Live) {
+        stepLivePage(forward);
+    }
+}
+
+static void serviceLiveCarousel(bool dataChanged) {
+    if (!livePageAvailable(livePage)) {
+        advanceLivePage();
+        return;
+    }
+    if (dataChanged) {
+        renderLivePage(livePage, false);  // also refreshes the dots when a page came or went
+    }
+    const uint32_t intervalMs = static_cast<uint32_t>(idleUiSettings.screenIntervalSec) * 1000U;
+    if (demoCarouselPaused || touchPressStartMs != 0) {
+        livePageShownMs = millis();  // scrolling a list, or resuming, gives the page a full interval
+    } else if (intervalMs > 0 && millis() - livePageShownMs >= intervalMs) {
+        // A list scrolls down a screenful at a time before the carousel moves on.
+        lv_obj_t *list = livePageList(livePage);
+        if (list && lv_obj_get_scroll_bottom(list) > 0) {
+            lv_obj_scroll_by_bounded(list, 0, -(lv_obj_get_height(list) - 48), LV_ANIM_ON);
+            livePageShownMs = millis();
+        } else {
+            advanceLivePage();
+        }
+    }
+}
+
+// Called from uiTask every loop: picks up new data/settings and advances the carousels on their timers.
+static void serviceCarousels() {
     bool changed = false;
     if (copyIdleScreensDataIfChanged(*idleUiData, idleUiDataVersion)) {
         idleUiDataVersion = idleUiData->version;
@@ -3347,6 +4016,10 @@ static void serviceIdleCarousel() {
         changed = true;
     }
 
+    if (currentMode == UiMode::Live) {
+        serviceLiveCarousel(changed);
+        return;
+    }
     if (currentMode != UiMode::Idle) {
         return;
     }
@@ -3355,134 +4028,758 @@ static void serviceIdleCarousel() {
         return;
     }
     if (changed) {
-        renderIdlePage(idlePage);
+        renderIdlePage(idlePage, false);
     }
     const uint32_t intervalMs = static_cast<uint32_t>(idleUiSettings.screenIntervalSec) * 1000U;
-    if (intervalMs > 0 && millis() - idlePageShownMs >= intervalMs) {
+    if (demoCarouselPaused || touchPressStartMs != 0) {
+        idlePageShownMs = millis();  // resuming, or letting go, gives the current page a full interval
+    } else if (intervalMs > 0 && millis() - idlePageShownMs >= intervalMs) {
         advanceIdlePage();
     }
 }
 
-static void backFromEventsCb(lv_event_t *) {
-    loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_MOVE_RIGHT);
+// Serves the `fps` serial command: advances the carousel, then reports the frames drawn in the next 500 ms.
+static void serviceFpsProbe() {
+    if (fpsRequested && fpsStartMs == 0) {
+        fpsRequested = false;
+        fpsFrames = 0;
+        fpsLongestMs = 0;
+        fpsFlushUs = 0;
+        fpsFlushes = 0;
+        fpsDmaUs = 0;
+        fpsDmaBytes = 0;
+        fpsStartMs = millis();
+        if (currentMode == UiMode::Idle) {
+            advanceIdlePage();
+        }
+        return;
+    }
+    if (fpsStartMs != 0 && millis() - fpsStartMs >= 500) {
+        Serial.printf("[FPS] %u frames in 500 ms (%u fps), longest frame %u ms, %u flushes, %u ms in flush\n",
+                      static_cast<unsigned>(fpsFrames), static_cast<unsigned>(fpsFrames * 2),
+                      static_cast<unsigned>(fpsLongestMs), static_cast<unsigned>(fpsFlushes),
+                      static_cast<unsigned>(fpsFlushUs / 1000));
+        Serial.printf("[FPS] panel transfers: %u KB in %u ms\n", static_cast<unsigned>(fpsDmaBytes / 1024),
+                      static_cast<unsigned>(fpsDmaUs / 1000));
+        fpsStartMs = 0;
+        // Cost of one full-screen redraw of the page now showing, averaged over a few frames.
+        const uint32_t startUs = micros();
+        for (int i = 0; i < 5; ++i) {
+            lv_obj_invalidate(lv_screen_active());
+            lv_refr_now(nullptr);
+        }
+        Serial.printf("[FPS] full redraw of this page: %u ms\n", static_cast<unsigned>((micros() - startUs) / 5000));
+        // Same for an empty screen: the floor set by filling and sending the frame.
+        lv_obj_t *previous = lv_screen_active();
+        lv_obj_t *blank = lv_obj_create(nullptr);
+        lv_obj_set_style_bg_color(blank, lv_color_hex(kUiBg), LV_PART_MAIN);
+        lv_screen_load(blank);
+        const uint32_t blankStartUs = micros();
+        for (int i = 0; i < 5; ++i) {
+            lv_obj_invalidate(blank);
+            lv_refr_now(nullptr);
+        }
+        Serial.printf("[FPS] full redraw of an empty screen: %u ms\n",
+                      static_cast<unsigned>((micros() - blankStartUs) / 5000));
+        lv_screen_load(previous);
+        lv_obj_delete(blank);
+    }
 }
 
-static void backFromSquadCb(lv_event_t *) {
-    loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_MOVE_TOP);
+// Serves the `screenshot [page]` serial command (see screenshotFrame).
+static void serviceScreenshot() {
+    if (!screenshotRequested) {
+        return;
+    }
+    if (screenshotAtMs == 0) {
+        const int page = screenshotPage;
+        if (page >= 0 && page < kIdlePageCount && currentMode == UiMode::Idle) {
+            carouselSubPage = 0;
+            showIdlePage(static_cast<IdlePage>(page));
+        } else if (page >= kIdlePageCount && page <= kIdlePageCount + 2 && currentMode == UiMode::Live) {
+            carouselSubPage = 0;
+            showLivePage(page == kIdlePageCount ? LivePage::Events : LivePage::Squad);
+        }
+        screenshotAtMs = millis() + (page >= 0 ? 1500U : 0U);  // let entrance animations finish
+        return;
+    }
+    if (static_cast<int32_t>(millis() - screenshotAtMs) < 0) {
+        return;
+    }
+    screenshotRequested = false;
+    screenshotAtMs = 0;
+    if (!screenshotFrame) {
+        screenshotFrame = static_cast<uint16_t *>(heap_caps_malloc(static_cast<size_t>(kDisplayWidth) * kDisplayHeight * 2,
+                                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (!screenshotFrame) {
+            Serial.println("SS ERROR no memory");
+            return;
+        }
+    }
+    if (screenshotPage == kIdlePageCount + 2 && ui.squadList) {
+        lv_obj_scroll_to_y(ui.squadList, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+    screenshotCapturing = true;
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(nullptr);
+    screenshotCapturing = false;
+
+    static char hex[kDisplayWidth * 4 + 1];
+    static const char kDigits[] = "0123456789abcdef";
+    Serial.printf("SS BEGIN %u %u\n", static_cast<unsigned>(kDisplayWidth), static_cast<unsigned>(kDisplayHeight));
+    for (int y = 0; y < kDisplayHeight; ++y) {
+        const uint16_t *row = screenshotFrame + y * kDisplayWidth;
+        for (int x = 0; x < kDisplayWidth; ++x) {
+            const uint16_t v = row[x];
+            hex[x * 4 + 0] = kDigits[(v >> 12) & 0xF];
+            hex[x * 4 + 1] = kDigits[(v >> 8) & 0xF];
+            hex[x * 4 + 2] = kDigits[(v >> 4) & 0xF];
+            hex[x * 4 + 3] = kDigits[v & 0xF];
+        }
+        hex[kDisplayWidth * 4] = '\0';
+        Serial.printf("SS %d %s\n", y, hex);
+    }
+    Serial.println("SS END");
 }
 
 static void showEventsEventCb(lv_event_t *) {
-    loadMode(UiMode::EventsList, LV_SCR_LOAD_ANIM_MOVE_LEFT);
-}
-
-static void showSquadFromHold(void) {
-    loadMode(UiMode::Squad, LV_SCR_LOAD_ANIM_MOVE_BOTTOM);
-    holdTriggered = true;
-    if (ui.liveHoldArc) {
-        lv_obj_add_flag(ui.liveHoldArc, LV_OBJ_FLAG_HIDDEN);
-        lv_arc_set_value(ui.liveHoldArc, 0);
+    if (currentMode == UiMode::Live && isTap()) {
+        carouselSubPage = 0;
+        showLivePage(LivePage::Events);
     }
 }
 
-static void livePressEventCb(lv_event_t *e) {
-    const lv_event_code_t code = lv_event_get_code(e);
-    if (ui.liveTickerBtn) {
-        lv_indev_t *indev = lv_indev_active();
-        if (indev) {
-            lv_point_t p;
-            lv_indev_get_point(indev, &p);
-            lv_area_t tickerArea;
-            lv_obj_get_coords(ui.liveTickerBtn, &tickerArea);
-            const bool inTicker = (p.x >= tickerArea.x1 && p.x <= tickerArea.x2 && p.y >= tickerArea.y1 && p.y <= tickerArea.y2);
-            if (inTicker) {
-                return;
+// Clears the events list (and the live card), so from now on it only shows what happens next.
+static void clearEventsCb(lv_event_t *) {
+    if (isTap()) {
+        clearUiEvents();
+        tickerEventIndex = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gameweek screens: deadline countdown, final hour, live gameweek, point pop-ups, and the events and squad lists.
+// Same design language as the carousel (ui_kit). The widgets are built once in createUi and updated every UI
+// loop by updateGameweekScreens through uiSetText / uiNumberSet, which only redraw what changed.
+// ---------------------------------------------------------------------------
+static constexpr int kListTop = 80;
+static constexpr int kListW = 300;
+static constexpr int kEventsListH = 234;  // leaves room for the Clear button above the page dots
+static constexpr int kSquadListH = 262;
+static constexpr int kListRowW = kListW - 4;
+static constexpr int kClearButtonY = 324;
+static int liveCardW = 0;  // width of the live screen's event card, set when it is built
+
+// "CLEAN SHEET!" -> "CLEAN SHEET" (upper) or "Clean sheet" (sentence case).
+static void formatEventLabel(const char *label, bool upper, char *out, size_t outLen) {
+    size_t n = 0;
+    for (size_t i = 0; label && label[i] && n + 1 < outLen; ++i) {
+        const char c = label[i];
+        if (c == '!') {
+            continue;
+        }
+        out[n] = static_cast<char>(upper || n == 0 ? toupper(static_cast<unsigned char>(c))
+                                                   : tolower(static_cast<unsigned char>(c)));
+        ++n;
+    }
+    while (n > 0 && out[n - 1] == ' ') {
+        --n;
+    }
+    out[n] = '\0';
+    if (n == 0) {
+        strlcpy(out, upper ? "POINTS" : "Points", outLen);
+    }
+}
+
+static UiTone eventTone(const UiEventItem &e) {
+    if (strcmp(e.icon, "YC") == 0) {
+        return UiTone::Warning;
+    }
+    return e.delta < 0 ? UiTone::Negative : UiTone::Positive;
+}
+
+static void formatAge(uint32_t sinceMs, char *out, size_t outLen) {
+    const uint32_t minutes = (millis() - sinceMs) / 60000U;
+    if (minutes < 1) {
+        strlcpy(out, "now", outLen);
+    } else if (minutes < 60) {
+        snprintf(out, outLen, "%um ago", static_cast<unsigned>(minutes));
+    } else {
+        snprintf(out, outLen, "%uh ago", static_cast<unsigned>(minutes / 60));
+    }
+}
+
+// Round badge with an event's short code ("G", "A", "CS", ...), tinted by its tone.
+static lv_obj_t *createEventBadge(lv_obj_t *parent) {
+    lv_obj_t *badge = uiStatusPill(parent, "", UiTone::Neutral);
+    lv_obj_set_size(badge, 36, 36);
+    lv_obj_set_style_pad_all(badge, 0, LV_PART_MAIN);
+    lv_obj_center(lv_obj_get_child(badge, 0));
+    return badge;
+}
+
+// Recent events rolled up per player, so "Haaland +1" then "Haaland +4" reads as one "Haaland +5".
+struct PlayerEvents {
+    char player[24] = "";
+    char team[24] = "";
+    char icon[8] = "";  // code of the player's biggest single event, for the badge
+    int biggest = 0;    // |points| of that event
+    int total = 0;
+    uint32_t latestMs = 0;
+    static constexpr size_t kMaxLabels = 8;
+    char labels[kMaxLabels][20] = {};  // what happened, in match order ("Goal", "Assist"), counted in labelCounts
+    uint8_t labelCounts[kMaxLabels] = {};
+    int labelPoints[kMaxLabels] = {};  // points from each
+    size_t labelCount = 0;
+};
+
+// Groups the recent events by player, the player with the newest event first. Returns the number of players.
+static size_t groupEventsByPlayer(const UiRuntimeState &runtime, PlayerEvents *out, size_t capacity) {
+    size_t n = 0;
+    for (size_t i = 0; i < runtime.recentEventCount; ++i) {  // oldest first, so labels read in match order
+        const UiEventItem &e = runtime.recentEvents[i];
+        PlayerEvents *p = nullptr;
+        for (size_t j = 0; j < n; ++j) {
+            if (strcmp(out[j].player, e.player) == 0 && strcmp(out[j].team, e.team) == 0) {
+                p = &out[j];
+                break;
             }
         }
+        if (!p) {
+            if (n >= capacity) {
+                continue;
+            }
+            p = &out[n++];
+            *p = PlayerEvents{};
+            strlcpy(p->player, e.player, sizeof(p->player));
+            strlcpy(p->team, e.team, sizeof(p->team));
+        }
+        p->total += e.delta;
+        p->latestMs = e.epochMs;
+        const int size = e.delta < 0 ? -e.delta : e.delta;
+        if (!p->icon[0] || size >= p->biggest) {
+            strlcpy(p->icon, e.icon[0] ? e.icon : (e.delta < 0 ? "-" : "+"), sizeof(p->icon));
+            p->biggest = size;
+        }
+        char label[20];
+        formatEventLabel(e.label, false, label, sizeof(label));
+        size_t k = 0;
+        while (k < p->labelCount && strcmp(p->labels[k], label) != 0) {
+            ++k;
+        }
+        if (k < p->labelCount) {
+            ++p->labelCounts[k];
+            p->labelPoints[k] += e.delta;
+        } else if (p->labelCount < PlayerEvents::kMaxLabels) {
+            strlcpy(p->labels[p->labelCount], label, sizeof(p->labels[0]));
+            p->labelCounts[p->labelCount] = 1;
+            p->labelPoints[p->labelCount++] = e.delta;
+        }
     }
+    for (size_t i = 1; i < n; ++i) {  // newest activity first
+        for (size_t j = i; j > 0 && out[j].latestMs > out[j - 1].latestMs; --j) {
+            const PlayerEvents tmp = out[j - 1];
+            out[j - 1] = out[j];
+            out[j] = tmp;
+        }
+    }
+    return n;
+}
 
-    if (code == LV_EVENT_PRESSED) {
-        holdStartMs = millis();
-        holdTriggered = false;
-        if (ui.liveHoldArc) {
-            lv_obj_remove_flag(ui.liveHoldArc, LV_OBJ_FLAG_HIDDEN);
-            lv_arc_set_value(ui.liveHoldArc, 0);
+// "Goal x2 +8, Assist +3, Bonus pts +2"
+static void formatPlayerEventLabels(const PlayerEvents &p, char *out, size_t outLen) {
+    out[0] = '\0';
+    for (size_t i = 0; i < p.labelCount; ++i) {
+        char part[40];
+        if (p.labelCounts[i] > 1) {
+            snprintf(part, sizeof(part), "%s%s x%u %+d", i ? ", " : "", p.labels[i],
+                     static_cast<unsigned>(p.labelCounts[i]), p.labelPoints[i]);
+        } else {
+            snprintf(part, sizeof(part), "%s%s %+d", i ? ", " : "", p.labels[i], p.labelPoints[i]);
         }
-    } else if (code == LV_EVENT_PRESSING) {
-        if (holdStartMs == 0 || holdTriggered || !ui.liveHoldArc) {
-            return;
-        }
-        const uint32_t elapsed = millis() - holdStartMs;
-        int progress = static_cast<int>((elapsed * 100U) / 3000U);
-        if (progress > 100) {
-            progress = 100;
-        }
-        lv_arc_set_value(ui.liveHoldArc, progress);
-        if (elapsed >= 3000U) {
-            showSquadFromHold();
-        }
-    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        holdStartMs = 0;
-        if (!holdTriggered && ui.liveHoldArc) {
-            lv_obj_add_flag(ui.liveHoldArc, LV_OBJ_FLAG_HIDDEN);
-            lv_arc_set_value(ui.liveHoldArc, 0);
-        }
-        holdTriggered = false;
+        strlcat(out, part, outLen);
     }
 }
 
-static lv_obj_t *createOverlayListScreen(lv_obj_t *screen, const char *title, lv_event_cb_t backCb) {
-    static constexpr int kPanelX = 340;
-    static constexpr int kPanelY = 340;
-    static constexpr int kPanelTop = 22;
-    static constexpr int kListW = 324;
-    static constexpr int kListH = 286;
-    static constexpr int kChordY = (kPanelTop + kPanelY) - 1;
+// A player's net points: gains are Positive, losses Negative (amber when it's just a booking), zero Neutral.
+static UiTone playerEventsTone(const PlayerEvents &p) {
+    if (p.total < 0) {
+        return strcmp(p.icon, "YC") == 0 ? UiTone::Warning : UiTone::Negative;
+    }
+    return p.total > 0 ? UiTone::Positive : UiTone::Neutral;
+}
 
-    lv_obj_t *panel = lv_obj_create(screen);
-    lv_obj_set_size(panel, kPanelX, kPanelY);
-    lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, kPanelTop);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(panel, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(panel, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
-    lv_obj_set_style_radius(panel, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(panel, 0, LV_PART_MAIN);
+static void setPlayerEventsBadge(lv_obj_t *badge, const PlayerEvents &p) {
+    uiStatusPillSet(badge, p.icon, playerEventsTone(p));
+}
 
-    lv_obj_t *titleLabel = createLabel(panel, kFontCaption, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(titleLabel, title);
-    lv_obj_align(titleLabel, LV_ALIGN_TOP_MID, 0, 10);
+// Pill-shaped button; `font` sets its size.
+static lv_obj_t *createPillButton(lv_obj_t *parent, const char *text, const lv_font_t *font, lv_event_cb_t cb) {
+    lv_obj_t *button = uiStatusPill(parent, text, UiTone::Neutral, font);
+    lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(button, lv_color_hex(kUiSurface), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(button, lv_color_hex(kUiSurfaceRaised), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_text_color(lv_obj_get_child(button, 0), lv_color_hex(kUiTextPrimary), LV_PART_MAIN);
+    lv_obj_add_event_cb(button, cb, LV_EVENT_CLICKED, nullptr);
+    return button;
+}
 
-    lv_obj_t *list = lv_obj_create(panel);
-    lv_obj_set_size(list, kListW, kListH);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 42);
-    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+// A live carousel page with a heading and a scrolling column of rows `h` high. Tapping it turns the page; the
+// page dots go in dotsOut. Returns the column.
+static lv_obj_t *createListScreen(lv_obj_t *screen, const char *title, int h, lv_obj_t *&dotsOut) {
+    lv_obj_remove_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(screen, carouselTapEventCb, LV_EVENT_CLICKED, nullptr);
+    uiScreenHeader(screen, title);
+
+    lv_obj_t *list = lv_obj_create(screen);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, kListW, h);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, kListTop);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_width(list, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(list, 0, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(list, 2, LV_PART_MAIN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(list, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(list, 8, LV_PART_MAIN);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(list, carouselTapEventCb, LV_EVENT_CLICKED, nullptr);  // LVGL sends no click after a scroll
 
-    lv_obj_t *chordLine = lv_obj_create(screen);
-    lv_obj_set_size(chordLine, kPanelX, 2);
-    lv_obj_align(chordLine, LV_ALIGN_TOP_MID, 0, kChordY);
-    lv_obj_set_style_bg_color(chordLine, lv_color_hex(kColorButtonPurple), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(chordLine, LV_OPA_70, LV_PART_MAIN);
-    lv_obj_set_style_border_width(chordLine, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(chordLine, 0, LV_PART_MAIN);
-
-    lv_obj_t *back = lv_button_create(screen);
-    lv_obj_set_size(back, kPanelX, kDisplayHeight - kChordY);
-    lv_obj_align(back, LV_ALIGN_TOP_MID, 0, kChordY);
-    lv_obj_set_style_radius(back, 0, LV_PART_MAIN);
-    stylePurpleButton(back);
-    lv_obj_set_style_border_width(back, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(back, backCb, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t *backLabel = createLabel(back, &lv_font_montserrat_32, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(backLabel, "<");
-    lv_obj_center(backLabel);
-
-    lv_obj_move_foreground(chordLine);
-    lv_obj_move_foreground(back);
+    dotsOut = uiBox(screen, kUiScreenSize, kUiScreenSize);
+    lv_obj_set_pos(dotsOut, 0, 0);
     return list;
+}
+
+static lv_obj_t *createListRow(lv_obj_t *list, int h) {
+    lv_obj_t *row = uiBox(list, kListRowW, h);
+    lv_obj_set_style_bg_color(row, lv_color_hex(kUiSurface), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, 16, LV_PART_MAIN);
+    return row;
+}
+
+//  (G)  Haaland                 +9
+//       Playing +1, 60+ mins +1,
+//       Goal +4, Assist +3 · 12m ago
+// The reasons wrap onto as many lines as they need.
+static void refreshEventsList(const UiRuntimeState &runtime) {
+    if (!ui.eventsList) {
+        return;
+    }
+    lv_obj_clean(ui.eventsList);
+    static PlayerEvents players[kMaxUiEvents];  // UI task only
+    const size_t count = groupEventsByPlayer(runtime, players, kMaxUiEvents);
+    if (ui.eventsClearBtn) {
+        if (count == 0) {
+            lv_obj_add_flag(ui.eventsClearBtn, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(ui.eventsClearBtn, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (count == 0) {
+        lv_obj_t *empty = uiLabel(ui.eventsList, UI_FONT_BODY, kUiTextSecondary);
+        lv_obj_set_style_pad_top(empty, 96, LV_PART_MAIN);
+        lv_label_set_text(empty, "No new points events");
+        return;
+    }
+
+    static constexpr int kTextX = 60;
+    static constexpr int kTextW = kListRowW - kTextX - 16;
+    static constexpr int kDeltaW = 64;
+    char buf[240];
+    char labels[200];
+    char age[16];
+    for (size_t i = 0; i < count; ++i) {
+        const PlayerEvents &p = players[i];
+        lv_obj_t *row = createListRow(ui.eventsList, LV_SIZE_CONTENT);
+        lv_obj_set_style_pad_bottom(row, 10, LV_PART_MAIN);
+        lv_obj_t *badge = createEventBadge(row);
+        setPlayerEventsBadge(badge, p);
+        lv_obj_set_pos(badge, 12, 10);
+
+        lv_obj_t *name = uiLabel(row, UI_FONT_NAME, kUiTextPrimary, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_width(name, kTextW - kDeltaW);
+        uiSingleLine(name);
+        lv_label_set_text(name, p.player);
+        lv_obj_set_pos(name, kTextX, 8);
+
+        snprintf(buf, sizeof(buf), "%+d", p.total);
+        lv_obj_t *delta = uiLabel(row, UI_FONT_VALUE, uiToneColor(playerEventsTone(p)), LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_width(delta, kDeltaW);
+        lv_label_set_text(delta, buf);
+        lv_obj_set_pos(delta, kListRowW - 16 - kDeltaW, 2);
+
+        formatPlayerEventLabels(p, labels, sizeof(labels));
+        formatAge(p.latestMs, age, sizeof(age));
+        snprintf(buf, sizeof(buf), "%s " UI_DOT " %s", labels, age);
+        lv_obj_t *meta = uiLabel(row, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_LEFT);
+        lv_obj_set_width(meta, kTextW);
+        lv_label_set_long_mode(meta, LV_LABEL_LONG_MODE_WRAP);
+        lv_obj_set_style_text_line_space(meta, 2, LV_PART_MAIN);
+        lv_label_set_text(meta, buf);
+        lv_obj_set_pos(meta, kTextX, 38);
+    }
+}
+
+//  Saka              [C]  G +5    12
+static void refreshSquadList(const UiRuntimeState &runtime) {
+    if (!ui.squadList) {
+        return;
+    }
+    lv_obj_clean(ui.squadList);
+    bool benchStarted = false;
+    char buf[16];
+    for (size_t i = 0; i < runtime.squadCount; ++i) {
+        const UiSquadRow &r = runtime.squadRows[i];
+        if (r.isBench && !benchStarted) {
+            benchStarted = true;
+            lv_obj_t *section = uiLabel(ui.squadList, UI_FONT_META, kUiTextSecondary, LV_TEXT_ALIGN_LEFT);
+            lv_obj_set_width(section, kListRowW - 24);
+            lv_obj_set_style_text_letter_space(section, 2, LV_PART_MAIN);
+            lv_obj_set_style_pad_top(section, 6, LV_PART_MAIN);
+            lv_label_set_text(section, "BENCH");
+        }
+        lv_obj_t *row = createListRow(ui.squadList, 46);
+        if (r.isBench) {
+            lv_obj_set_style_bg_opa(row, LV_OPA_50, LV_PART_MAIN);
+        }
+        lv_obj_t *line = createRowLine(row, 16, kListRowW - 16 - kRowPadX, LV_ALIGN_LEFT_MID, 0);
+        lv_obj_t *name = createGrowingName(line, UI_FONT_BODY, r.player);
+        if (r.isBench) {
+            lv_obj_set_style_text_color(name, lv_color_hex(kUiTextSecondary), LV_PART_MAIN);
+        }
+        if (r.isCaptain || r.isViceCaptain) {
+            uiStatusPill(line, r.isCaptain ? "C" : "V", r.isCaptain ? UiTone::Accent : UiTone::Neutral);
+        }
+        if (r.breakdown[0]) {
+            lv_obj_t *breakdown = uiLabel(line, UI_FONT_META, kUiTextSecondary);
+            lv_label_set_text(breakdown, r.breakdown);
+        }
+        lv_obj_t *points = uiLabel(line, UI_FONT_NAME, r.hasPlayed ? kUiTextPrimary : kUiTextSecondary,
+                                   LV_TEXT_ALIGN_RIGHT);
+        lv_obj_set_style_min_width(points, 30, LV_PART_MAIN);
+        if (r.hasPlayed) {
+            snprintf(buf, sizeof(buf), "%d", r.points);
+        } else {
+            strlcpy(buf, UI_DASH, sizeof(buf));
+        }
+        lv_label_set_text(points, buf);
+    }
+
+    // Scripted demos (pop-up / deadline countdowns), for showing the device off.
+    lv_obj_t *demo = uiBox(ui.squadList, kListRowW, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(demo, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(demo, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(demo, 8, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(demo, 8, LV_PART_MAIN);
+    lv_obj_t *buttons[3] = {createPillButton(demo, "DEMO POP-UP", UI_FONT_PILL, squadDemoNotificationBtnCb),
+                            createPillButton(demo, "45M", UI_FONT_PILL, squadDemoDeadline45BtnCb),
+                            createPillButton(demo, "7M", UI_FONT_PILL, squadDemoDeadline7BtnCb)};
+    for (lv_obj_t *button : buttons) {
+        lv_obj_set_style_pad_ver(button, 9, LV_PART_MAIN);
+    }
+}
+
+// --- Deadline and final hour ----------------------------------------------------------------------------------
+static void createDeadlineScreens() {
+    lv_obj_t *s = ui.screenDeadline;
+    uiScreenHeader(s, "DEADLINE");
+    ui.deadlineMeta = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_align(ui.deadlineMeta, LV_ALIGN_TOP_MID, 0, kUiHeaderY + 26);
+    ui.deadlineCountdown = uiLabel(s, UI_FONT_HERO, kUiTextPrimary);
+    lv_label_set_text(ui.deadlineCountdown, "--:--:--");
+    lv_obj_align(ui.deadlineCountdown, LV_ALIGN_CENTER, 0, -20);
+    ui.deadlineLabel = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_set_style_text_letter_space(ui.deadlineLabel, 2, LV_PART_MAIN);
+    lv_label_set_text(ui.deadlineLabel, "HRS     MIN     SEC");
+    lv_obj_align(ui.deadlineLabel, LV_ALIGN_CENTER, 0, 20);
+    ui.deadlineWhen = uiStatusPill(s, "", UiTone::Neutral, UI_FONT_BODY);
+    lv_obj_align(ui.deadlineWhen, LV_ALIGN_CENTER, 0, 80);
+
+    s = ui.screenFinalHour;
+    ui.finalArc = lv_arc_create(s);
+    lv_obj_set_size(ui.finalArc, kUiScreenSize, kUiScreenSize);
+    lv_obj_center(ui.finalArc);
+    lv_arc_set_rotation(ui.finalArc, 270);
+    lv_arc_set_bg_angles(ui.finalArc, 0, 360);
+    lv_arc_set_range(ui.finalArc, 0, 3600);
+    lv_arc_set_value(ui.finalArc, 3600);
+    lv_obj_set_style_arc_width(ui.finalArc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(kUiSurface), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(ui.finalArc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(kUiWarning), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_rounded(ui.finalArc, true, LV_PART_INDICATOR);
+    lv_obj_remove_style(ui.finalArc, nullptr, LV_PART_KNOB);
+    lv_obj_remove_flag(ui.finalArc, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *heading = uiLabel(s, UI_FONT_HEADING, kUiWarning);
+    lv_obj_set_style_text_letter_space(heading, 2, LV_PART_MAIN);
+    lv_label_set_text(heading, "FINAL HOUR");
+    lv_obj_align(heading, LV_ALIGN_CENTER, 0, -72);
+    ui.finalCountdown = uiLabel(s, UI_FONT_HERO, kUiTextPrimary);
+    lv_label_set_text(ui.finalCountdown, "--:--");
+    lv_obj_align(ui.finalCountdown, LV_ALIGN_CENTER, 0, -10);
+    ui.finalMeta = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_align(ui.finalMeta, LV_ALIGN_CENTER, 0, 48);
+}
+
+// --- Live -----------------------------------------------------------------------------------------------------
+//        ● GW6 LIVE
+//            64
+//          POINTS
+//         LIVE RANK
+//    538,544  [▲ 12,345]
+//   [ (G) Saka      +6  > ]
+static void createLiveScreen() {
+    lv_obj_t *s = ui.screenLive;
+    lv_obj_remove_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = uiBox(s, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(title, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(title, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(title, 10, LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, kUiHeaderY);
+    ui.liveDot = uiDot(title, 10, kUiAccent);
+    uiBreathe(ui.liveDot);
+    ui.liveTitle = uiLabel(title, UI_FONT_HEADING, kUiAccent);
+    lv_obj_set_style_text_letter_space(ui.liveTitle, 2, LV_PART_MAIN);
+    lv_label_set_text(ui.liveTitle, "LIVE");
+
+    ui.livePoints = uiLabel(s, UI_FONT_HERO, kUiTextPrimary);
+    uiNumberInit(ui.livePoints);
+    lv_label_set_text(ui.livePoints, "--");
+    lv_obj_align(ui.livePoints, LV_ALIGN_CENTER, 0, -80);
+    lv_obj_t *pointsLabel = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_set_style_text_letter_space(pointsLabel, 2, LV_PART_MAIN);
+    lv_label_set_text(pointsLabel, "GW POINTS");
+    lv_obj_align(pointsLabel, LV_ALIGN_CENTER, 0, -36);
+
+    lv_obj_t *rankLabel = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_set_style_text_letter_space(rankLabel, 2, LV_PART_MAIN);
+    lv_label_set_text(rankLabel, "LIVE RANK");
+    lv_obj_align(rankLabel, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_t *rankRow = uiBox(s, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(rankRow, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(rankRow, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(rankRow, 10, LV_PART_MAIN);
+    lv_obj_align(rankRow, LV_ALIGN_CENTER, 0, 38);
+    ui.liveRank = uiLabel(rankRow, UI_FONT_VALUE, kUiTextPrimary);
+    uiNumberInit(ui.liveRank);
+    lv_label_set_text(ui.liveRank, "--");
+    ui.liveRankMove = uiStatusPill(rankRow, "", UiTone::Neutral);
+    lv_obj_add_flag(ui.liveRankMove, LV_OBJ_FLAG_HIDDEN);
+
+    // Latest points event; tap it for the events page (a tap anywhere else turns to the next page).
+    static constexpr int kCardCy = 114;
+    static constexpr int kCardH = 60;
+    const int cardW = uiSafeWidth(kCardCy, kCardH - 12, 8);
+    liveCardW = cardW;
+    ui.liveTickerBtn = uiListRow(s, kCardCy, cardW, kCardH);
+    lv_obj_add_flag(ui.liveTickerBtn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_color(ui.liveTickerBtn, lv_color_hex(kUiSurfaceRaised), LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_add_event_cb(ui.liveTickerBtn, showEventsEventCb, LV_EVENT_CLICKED, nullptr);
+    ui.liveEventBadge = createEventBadge(ui.liveTickerBtn);
+    lv_obj_align(ui.liveEventBadge, LV_ALIGN_LEFT_MID, 14, 0);
+    ui.liveTickerLabel = uiLabel(ui.liveTickerBtn, UI_FONT_NAME, kUiTextPrimary, LV_TEXT_ALIGN_LEFT);
+    lv_obj_set_width(ui.liveTickerLabel, cardW - 62 - 90);
+    uiSingleLine(ui.liveTickerLabel);
+    lv_obj_align(ui.liveTickerLabel, LV_ALIGN_LEFT_MID, 62, 0);
+    ui.liveEventDelta = uiLabel(ui.liveTickerBtn, UI_FONT_NAME, kUiPositive, LV_TEXT_ALIGN_RIGHT);
+    lv_obj_align(ui.liveEventDelta, LV_ALIGN_RIGHT_MID, -40, 0);
+    lv_obj_t *chevron = uiLabel(ui.liveTickerBtn, UI_FONT_META, kUiTextSecondary);
+    lv_label_set_text(chevron, UI_SYM_ARROW);
+    lv_obj_align(chevron, LV_ALIGN_RIGHT_MID, -16, 0);
+
+    lv_obj_add_event_cb(s, carouselTapEventCb, LV_EVENT_CLICKED, nullptr);
+    ui.liveDots = uiBox(s, kUiScreenSize, kUiScreenSize);
+    lv_obj_set_pos(ui.liveDots, 0, 0);
+}
+
+// --- Points pop-up --------------------------------------------------------------------------------------------
+//          GOAL
+//         [kit]
+//          Saka
+//        [+6 PTS]
+//      51  ->  57 pts
+static void createPopupScreen() {
+    lv_obj_t *s = ui.screenPopup;
+    lv_obj_remove_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+    ui.popupTitle = uiLabel(s, UI_FONT_VALUE, kUiPositive);
+    lv_obj_set_style_text_letter_space(ui.popupTitle, 2, LV_PART_MAIN);
+    lv_obj_set_width(ui.popupTitle, uiSafeWidth(-140, 36));
+    uiSingleLine(ui.popupTitle);
+    lv_obj_align(ui.popupTitle, LV_ALIGN_CENTER, 0, -140);
+
+    memset(&kitImageDsc, 0, sizeof(kitImageDsc));
+    kitImageDsc.header.magic = LV_IMAGE_HEADER_MAGIC;
+    kitImageDsc.header.cf = LV_COLOR_FORMAT_RGB565;
+    kitImageDsc.header.w = kKitWidth;
+    kitImageDsc.header.h = kKitHeight;
+    kitImageDsc.data_size = kKitRgb565Bytes;
+    kitImageDsc.data = kitImageBuffer;
+    ui.popupKit = lv_image_create(s);
+    lv_image_set_src(ui.popupKit, &kitImageDsc);
+    lv_obj_align(ui.popupKit, LV_ALIGN_CENTER, 0, -42);
+
+    ui.popupPlayer = uiLabel(s, UI_FONT_VALUE, kUiTextPrimary);
+    lv_obj_set_width(ui.popupPlayer, uiSafeWidth(66, 36));
+    uiSingleLine(ui.popupPlayer);
+    lv_obj_align(ui.popupPlayer, LV_ALIGN_CENTER, 0, 66);
+    ui.popupDelta = uiStatusPill(s, "", UiTone::Positive, UI_FONT_NAME);
+    lv_obj_align(ui.popupDelta, LV_ALIGN_CENTER, 0, 106);
+    ui.popupTotal = uiLabel(s, UI_FONT_META, kUiTextSecondary);
+    lv_obj_align(ui.popupTotal, LV_ALIGN_CENTER, 0, 144);
+}
+
+static void fillPopup(const UiEventItem &event) {
+    const UiTone tone = eventTone(event);
+    const uint32_t color = uiToneColor(tone);
+    char buf[48];
+    formatEventLabel(event.label, true, buf, sizeof(buf));
+    uiSetText(ui.popupTitle, buf);
+    uiSetTextColor(ui.popupTitle, color);
+    uiSetText(ui.popupPlayer, event.player);
+    snprintf(buf, sizeof(buf), "%+d PTS", event.delta);
+    uiStatusPillSet(ui.popupDelta, buf, tone);
+    snprintf(buf, sizeof(buf), "%d  " UI_SYM_ARROW "  %d pts", event.totalBefore, event.totalAfter);
+    uiSetText(ui.popupTotal, buf);
+
+    if (resolveAndLoadKitImage(event)) {
+        lv_obj_remove_flag(ui.popupKit, LV_OBJ_FLAG_HIDDEN);
+        lv_image_set_src(ui.popupKit, &kitImageDsc);
+        uiPopIn(ui.popupKit, 120);
+    } else {
+        lv_obj_add_flag(ui.popupKit, LV_OBJ_FLAG_HIDDEN);
+    }
+    uiFadeIn(ui.popupDelta, 250, 260);
+    uiPulseRing(color);
+}
+
+// --- Updates --------------------------------------------------------------------------------------------------
+static int64_t secondsUntilDeadline(const SharedUiState &state) {
+    const time_t now = time(nullptr);
+    const int64_t sec = now > 100000 ? static_cast<int64_t>(state.nextDeadlineUtc) - static_cast<int64_t>(now) : 0;
+    return sec > 0 ? sec : 0;
+}
+
+static void updateGameweekScreens(const SharedUiState &state, const UiRuntimeState &runtime) {
+    char buf[64];
+
+    if (state.hasNextDeadline) {
+        const int64_t sec = secondsUntilDeadline(state);
+        snprintf(buf, sizeof(buf), "%02d:%02d:%02d", static_cast<int>(sec / 3600), static_cast<int>((sec % 3600) / 60),
+                 static_cast<int>(sec % 60));
+        uiSetText(ui.deadlineCountdown, buf);
+        snprintf(buf, sizeof(buf), "Gameweek %d", state.hasNextGw ? state.nextGw : 0);
+        uiSetText(ui.deadlineMeta, buf);
+
+        const time_t deadline = state.nextDeadlineUtc;
+        struct tm local;
+        localtime_r(&deadline, &local);
+        static const char *const kDays[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+        snprintf(buf, sizeof(buf), "%s %02d:%02d", kDays[local.tm_wday % 7], local.tm_hour, local.tm_min);
+        uiStatusPillSet(ui.deadlineWhen, buf, UiTone::Neutral);
+
+        const int64_t finalSec = sec > 3600 ? 3600 : sec;
+        snprintf(buf, sizeof(buf), "%02d:%02d", static_cast<int>(finalSec / 60), static_cast<int>(finalSec % 60));
+        uiSetText(ui.finalCountdown, buf);
+        snprintf(buf, sizeof(buf), "GW%d deadline %02d:%02d", state.hasNextGw ? state.nextGw : 0, local.tm_hour,
+                 local.tm_min);
+        uiSetText(ui.finalMeta, buf);
+        lv_arc_set_value(ui.finalArc, static_cast<int32_t>(finalSec));
+        // The ring turns from amber to red for the last five minutes.
+        static bool finalUrgent = false;
+        const bool urgent = finalSec < 300;
+        if (urgent != finalUrgent) {
+            lv_obj_set_style_arc_color(ui.finalArc, lv_color_hex(urgent ? kUiNegative : kUiWarning), LV_PART_INDICATOR);
+            finalUrgent = urgent;
+        }
+    }
+
+    snprintf(buf, sizeof(buf), "GW%d LIVE", state.currentGw);
+    uiSetText(ui.liveTitle, buf);
+    static int dotStale = -1;
+    if (dotStale != (state.isStale ? 1 : 0)) {
+        dotStale = state.isStale ? 1 : 0;
+        lv_obj_set_style_bg_color(ui.liveDot, lv_color_hex(state.isStale ? kUiWarning : kUiAccent), LV_PART_MAIN);
+        if (state.isStale) {
+            uiBreatheStop(ui.liveDot);
+        } else {
+            uiBreathe(ui.liveDot);
+        }
+    }
+    if (state.hasGwPoints) {
+        uiNumberSet(ui.livePoints, state.gwPoints, true);
+    } else {
+        uiNumberClear(ui.livePoints, "--");
+    }
+    if (state.hasRankData) {
+        uiNumberSet(ui.liveRank, state.overallRank, true);
+        char diffBuf[24];
+        formatNumberWithCommas(state.rankDiff < 0 ? -state.rankDiff : state.rankDiff, diffBuf, sizeof(diffBuf));
+        if (state.rankDiff != 0) {
+            snprintf(buf, sizeof(buf), "%s %s", state.rankDiff > 0 ? UI_SYM_UP : UI_SYM_DOWN, diffBuf);
+            uiStatusPillSet(ui.liveRankMove, buf, state.rankDiff > 0 ? UiTone::Positive : UiTone::Negative);
+            lv_obj_remove_flag(ui.liveRankMove, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(ui.liveRankMove, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else {
+        uiNumberClear(ui.liveRank, "--");
+        lv_obj_add_flag(ui.liveRankMove, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // The event card cycles through the players with recent events (points summed per player), newest first.
+    // With none, its text takes the whole card.
+    static PlayerEvents cardPlayers[kMaxUiEvents];  // regrouped only when the events change
+    static size_t cardPlayerCount = 0;
+    static uint32_t cardEventVersion = UINT32_MAX;
+    if (cardEventVersion != runtime.eventVersion) {
+        cardEventVersion = runtime.eventVersion;
+        cardPlayerCount = groupEventsByPlayer(runtime, cardPlayers, kMaxUiEvents);
+    }
+    static int cardEmpty = -1;
+    if (cardEmpty != (runtime.recentEventCount == 0 ? 1 : 0)) {
+        cardEmpty = runtime.recentEventCount == 0 ? 1 : 0;
+        lv_obj_set_width(ui.liveTickerLabel, cardEmpty ? liveCardW - 20 - 40 : liveCardW - 62 - 90);
+        lv_obj_align(ui.liveTickerLabel, LV_ALIGN_LEFT_MID, cardEmpty ? 20 : 62, 0);
+    }
+    if (runtime.recentEventCount == 0) {
+        uiSetText(ui.liveTickerLabel, "No events yet");
+        uiSetTextColor(ui.liveTickerLabel, kUiTextSecondary);
+        lv_obj_add_flag(ui.liveEventBadge, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ui.liveEventDelta, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        if (millis() - lastTickerRotateMs > 3000U) {
+            tickerEventIndex = cardPlayerCount ? (tickerEventIndex + 1) % cardPlayerCount : 0;
+            lastTickerRotateMs = millis();
+        }
+        if (tickerEventIndex >= cardPlayerCount) {
+            tickerEventIndex = 0;
+        }
+        const PlayerEvents &p = cardPlayers[tickerEventIndex];
+        uiSetText(ui.liveTickerLabel, p.player);
+        uiSetTextColor(ui.liveTickerLabel, kUiTextPrimary);
+        setPlayerEventsBadge(ui.liveEventBadge, p);
+        snprintf(buf, sizeof(buf), "%+d", p.total);
+        uiSetText(ui.liveEventDelta, buf);
+        uiSetTextColor(ui.liveEventDelta, uiToneColor(playerEventsTone(p)));
+        lv_obj_remove_flag(ui.liveEventBadge, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(ui.liveEventDelta, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Battery: sampled on the UI task and smoothed, since WiFi bursts and backlight changes pull the voltage around.
+static constexpr uint32_t kBatterySampleMs = 5000;
+static float batterySmoothedVolts = 0.0f;
+static volatile int batteryTestPercent = -1;  // `device battery <percent>` shows this instead, -1 = measured
+
+static void batterySampleCb(lv_timer_t *) {
+    static constexpr float kSmoothing = 0.2f;
+    const float volts = batteryVolts();
+    batterySmoothedVolts =
+        batterySmoothedVolts <= 0.0f ? volts : batterySmoothedVolts + kSmoothing * (volts - batterySmoothedVolts);
+    const int testPercent = batteryTestPercent;
+    uiBatterySet(testPercent >= 0 ? testPercent : batteryPercent(batterySmoothedVolts));
 }
 
 static void createUi(void) {
@@ -3495,121 +4792,40 @@ static void createUi(void) {
     ui.screenEvents = lv_obj_create(nullptr);
     ui.screenSquad = lv_obj_create(nullptr);
 
-    styleScreen(ui.screenIdle, kColorBgDeep);
-    styleScreen(ui.screenDeadline, kColorBgDeep);
-    styleScreen(ui.screenFinalHour, 0x0C0B14);
-    styleScreen(ui.screenLive, kColorBgDeep);
-    styleScreen(ui.screenPopup, kColorBgDeep);
-    styleScreen(ui.screenEvents, kColorBgDeep);
-    styleScreen(ui.screenSquad, kColorBgDeep);
+    styleScreen(ui.screenIdle, kUiBg);
+    styleScreen(ui.screenDeadline, kUiBg);
+    styleScreen(ui.screenFinalHour, kUiBg);
+    styleScreen(ui.screenLive, kUiBg);
+    styleScreen(ui.screenPopup, kUiBg);
+    styleScreen(ui.screenEvents, kUiBg);
+    styleScreen(ui.screenSquad, kUiBg);
 
-    lv_obj_t *idleRing = lv_arc_create(ui.screenIdle);
-    lv_obj_set_size(idleRing, 340, 340);
-    lv_obj_center(idleRing);
-    lv_obj_set_style_arc_color(idleRing, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
-    lv_obj_set_style_arc_opa(idleRing, LV_OPA_30, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(idleRing, 1, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(idleRing, 0, LV_PART_INDICATOR);
-    lv_obj_remove_style(idleRing, nullptr, LV_PART_KNOB);
-    lv_obj_remove_flag(idleRing, LV_OBJ_FLAG_CLICKABLE);
-
-    ui.idleRankArrow = createLabel(ui.screenIdle, kFontBody, kColorAccentGreen, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.idleRankArrow, LV_ALIGN_CENTER, -68, -48);
-    ui.idleRankValue = createLabel(ui.screenIdle, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.idleRankValue, LV_ALIGN_CENTER, 16, -48);
-    ui.idleGwPoints = createLabel(ui.screenIdle, &lv_font_montserrat_26, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.idleGwPoints, LV_ALIGN_CENTER, 0, 36);
-    ui.idleTotalPoints = createLabel(ui.screenIdle, kFontCaption, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.idleTotalPoints, LV_ALIGN_CENTER, 0, 78);
-    ui.statusLabel = createLabel(ui.screenIdle, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.statusLabel, LV_ALIGN_BOTTOM_MID, 0, -22);
-    lv_obj_add_event_cb(ui.screenIdle, idleTapEventCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_remove_flag(ui.screenIdle, LV_OBJ_FLAG_SCROLLABLE);
+    createHomeScreen();
+    lv_obj_add_event_cb(ui.screenIdle, carouselTapEventCb, LV_EVENT_CLICKED, nullptr);
 
     ui.screenIdleGraph = createIdleCarouselScreen(ui.idleGraphBody);
     ui.screenIdlePrices = createIdleCarouselScreen(ui.idlePricesBody);
     ui.screenIdleWatch = createIdleCarouselScreen(ui.idleWatchBody);
     ui.screenIdleLeagues = createIdleCarouselScreen(ui.idleLeaguesBody);
 
-    ui.deadlineLabel = createLabel(ui.screenDeadline, &lv_font_montserrat_28, kColorAccentAmber, LV_TEXT_ALIGN_CENTER);
-    lv_label_set_text(ui.deadlineLabel, "DEADLINE");
-    lv_obj_align(ui.deadlineLabel, LV_ALIGN_CENTER, 0, -110);
-    ui.deadlineCountdown = createLabel(ui.screenDeadline, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.deadlineCountdown, LV_ALIGN_CENTER, 0, -20);
-    ui.deadlineMeta = createLabel(ui.screenDeadline, &lv_font_montserrat_22, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.deadlineMeta, LV_ALIGN_CENTER, 0, 84);
-
-    ui.finalCountdown = createLabel(ui.screenFinalHour, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_center(ui.finalCountdown);
-
-    ui.liveTitle = createLabel(ui.screenLive, &lv_font_montserrat_16, kColorAccentCyan, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.liveTitle, LV_ALIGN_TOP_MID, 0, 24);
-    ui.liveDot = lv_obj_create(ui.screenLive);
-    lv_obj_set_size(ui.liveDot, 8, 8);
-    lv_obj_align(ui.liveDot, LV_ALIGN_TOP_MID, 84, 30);
-    lv_obj_set_style_radius(ui.liveDot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(ui.liveDot, lv_color_hex(kColorAccentCyan), LV_PART_MAIN);
-    lv_obj_set_style_border_width(ui.liveDot, 0, LV_PART_MAIN);
-    ui.livePoints = createLabel(ui.screenLive, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.livePoints, LV_ALIGN_CENTER, 0, -46);
-    ui.liveRank = createLabel(ui.screenLive, &lv_font_montserrat_26, kColorAccentGreen, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.liveRank, LV_ALIGN_CENTER, 0, 26);
-    static constexpr int kLiveEventsTopY = static_cast<int>(kDisplayHeight) - 116;
-    lv_obj_t *liveEventsLine = lv_obj_create(ui.screenLive);
-    lv_obj_set_size(liveEventsLine, kDisplayWidth, 2);
-    lv_obj_align(liveEventsLine, LV_ALIGN_TOP_MID, 0, kLiveEventsTopY);
-    lv_obj_set_style_bg_color(liveEventsLine, lv_color_hex(kColorButtonPurple), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(liveEventsLine, LV_OPA_70, LV_PART_MAIN);
-    lv_obj_set_style_border_width(liveEventsLine, 0, LV_PART_MAIN);
-    lv_obj_set_style_radius(liveEventsLine, 0, LV_PART_MAIN);
-
-    ui.liveTickerBtn = lv_button_create(ui.screenLive);
-    lv_obj_set_size(ui.liveTickerBtn, kDisplayWidth, static_cast<int>(kDisplayHeight) - kLiveEventsTopY);
-    lv_obj_align(ui.liveTickerBtn, LV_ALIGN_TOP_MID, 0, kLiveEventsTopY);
-    stylePurpleButton(ui.liveTickerBtn);
-    lv_obj_set_style_radius(ui.liveTickerBtn, 0, LV_PART_MAIN);
-    lv_obj_set_style_border_width(ui.liveTickerBtn, 0, LV_PART_MAIN);
-    lv_obj_add_event_cb(ui.liveTickerBtn, showEventsEventCb, LV_EVENT_CLICKED, nullptr);
-    ui.liveTickerLabel = createLabel(ui.liveTickerBtn, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.liveTickerLabel, LV_ALIGN_TOP_MID, 0, 10);
-    ui.liveHoldArc = lv_arc_create(ui.screenLive);
-    lv_obj_set_size(ui.liveHoldArc, 360, 360);
-    lv_obj_center(ui.liveHoldArc);
-    lv_arc_set_range(ui.liveHoldArc, 0, 100);
-    lv_obj_set_style_arc_width(ui.liveHoldArc, 4, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(ui.liveHoldArc, lv_color_hex(kColorAccentCyan), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(ui.liveHoldArc, 0, LV_PART_MAIN);
-    lv_obj_remove_style(ui.liveHoldArc, nullptr, LV_PART_KNOB);
-    lv_obj_remove_flag(ui.liveHoldArc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(ui.liveHoldArc, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(ui.screenLive, livePressEventCb, LV_EVENT_PRESSED, nullptr);
-    lv_obj_add_event_cb(ui.screenLive, livePressEventCb, LV_EVENT_PRESSING, nullptr);
-    lv_obj_add_event_cb(ui.screenLive, livePressEventCb, LV_EVENT_RELEASED, nullptr);
-    lv_obj_add_event_cb(ui.screenLive, livePressEventCb, LV_EVENT_PRESS_LOST, nullptr);
-
-    ui.popupTitle = createLabel(ui.screenPopup, kFontLarge, kColorAccentGreen, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupTitle, LV_ALIGN_CENTER, 0, -140);
-    memset(&kitImageDsc, 0, sizeof(kitImageDsc));
-    kitImageDsc.header.magic = LV_IMAGE_HEADER_MAGIC;
-    kitImageDsc.header.cf = LV_COLOR_FORMAT_RGB565;
-    kitImageDsc.header.w = kKitWidth;
-    kitImageDsc.header.h = kKitHeight;
-    kitImageDsc.data_size = kKitRgb565Bytes;
-    kitImageDsc.data = kitImageBuffer;
-    ui.popupKit = lv_image_create(ui.screenPopup);
-    lv_image_set_src(ui.popupKit, &kitImageDsc);
-    lv_obj_align(ui.popupKit, LV_ALIGN_CENTER, 0, -24);
-    ui.popupPlayer = createLabel(ui.screenPopup, kFontLarge, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupPlayer, LV_ALIGN_CENTER, 0, 68);
-    ui.popupDelta = createLabel(ui.screenPopup, &lv_font_montserrat_28, kColorAccentGreen, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupDelta, LV_ALIGN_CENTER, 0, 118);
-    ui.popupTotal = createLabel(ui.screenPopup, kFontBody, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
-    lv_obj_align(ui.popupTotal, LV_ALIGN_CENTER, 0, 154);
-
-    ui.eventsList = createOverlayListScreen(ui.screenEvents, "EVENTS", backFromEventsCb);
-    ui.squadList = createOverlayListScreen(ui.screenSquad, "MY SQUAD", backFromSquadCb);
+    createDeadlineScreens();
+    createLiveScreen();
+    createPopupScreen();
+    ui.eventsList = createListScreen(ui.screenEvents, "EVENTS", kEventsListH, ui.eventsDots);
+    ui.eventsClearBtn = createPillButton(ui.screenEvents, "CLEAR", UI_FONT_PILL, clearEventsCb);
+    lv_obj_set_style_pad_hor(ui.eventsClearBtn, 22, LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(ui.eventsClearBtn, 8, LV_PART_MAIN);
+    lv_obj_align(ui.eventsClearBtn, LV_ALIGN_TOP_MID, 0, kClearButtonY);
+    lv_obj_add_flag(ui.eventsClearBtn, LV_OBJ_FLAG_HIDDEN);
+    ui.squadList = createListScreen(ui.screenSquad, "MY SQUAD", kSquadListH, ui.squadDots);
 
     lv_screen_load(ui.screenIdle);
     currentMode = UiMode::Idle;
+
+    uiBatteryCreate();
+    batterySampleCb(nullptr);
+    lv_timer_create(batterySampleCb, kBatterySampleMs, nullptr);
 }
 
 static void setSharedStatus(const char *text, uint32_t colorHex) {
@@ -3792,6 +5008,7 @@ static void startNotificationScriptedDemo() {
     }
 
     setSharedGameweekContext(true, currentGw, nextGw, hasNextGw, local.nextDeadlineUtc, local.hasNextDeadline);
+    ledRingSetLiveState(true, true);
     setSharedRankData(baseRank, -500, true);
     setSharedStatus("Demo: rank dropping", 0xFF5A5A);
     loadMode(UiMode::Live, LV_SCR_LOAD_ANIM_FADE_ON);
@@ -3820,6 +5037,7 @@ static void startDeadlineScriptedDemo(int32_t secondsToDeadline) {
     const bool hasNextGw = local.hasNextGw || nextGw > 0;
     const time_t deadlineUtc = nowUtc + secondsToDeadline;
     setSharedGameweekContext(false, currentGw, nextGw, hasNextGw, deadlineUtc, true);
+    ledRingSetLiveState(false, false);
     setSharedStatus("Demo: custom deadline", 0x00E5FF);
     loadMode(UiMode::FinalHour, LV_SCR_LOAD_ANIM_FADE_ON);
 }
@@ -4094,8 +5312,15 @@ static bool connectWiFi() {
         return true;
     }
 
+    static DeviceConfig config;  // static: keeps the credentials off the task stack
+    deviceConfigGet(config);
+    if (!config.wifiSsid[0]) {
+        Serial.println("No WiFi network configured");
+        return false;
+    }
+    WiFi.setHostname(kWebHostname);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    WiFi.begin(config.wifiSsid, config.wifiPassword);
 
     const uint32_t startMs = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - startMs < 15000) {
@@ -4111,16 +5336,21 @@ static bool connectWiFi() {
     return false;
 }
 
+// Lock-free, so it never reports "off" just because another task holds demoMutex.
 static bool isDemoModeEnabled() {
-    if (!demoMutex) {
-        return false;
-    }
-    if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(20)) != pdTRUE) {
-        return false;
-    }
-    const bool enabled = demoState.enabled;
-    xSemaphoreGive(demoMutex);
-    return enabled;
+    return demoEnabledFlag;
+}
+
+// Caller holds demoMutex.
+static void setDemoEnabledLocked(bool enabled) {
+    demoState.enabled = enabled;
+    demoEnabledFlag = enabled;
+}
+
+// GW points from the demo squad (plus any manual adjustment); the total moves with them. Caller holds demoMutex.
+static void demoRecomputePointsLocked() {
+    demoState.gwPoints = computeGwPointsFromPicks(demoState.picks, demoState.pickCount) + demoState.pointsAdjust;
+    demoState.totalPoints = demoState.seededTotalPoints + (demoState.gwPoints - demoState.seededGwPoints);
 }
 
 static bool copyDemoState(DemoState &out) {
@@ -4140,11 +5370,12 @@ static void publishDemoStateToUi(const DemoState &state) {
     setSharedRankData(state.overallRank, state.rankDiff, state.hasRankData);
     setSharedTotalPoints(state.totalPoints, state.seeded);
     setSharedGameweekContext(state.isLiveGw, state.currentGw, state.nextGw, state.hasNextGw, state.deadlineUtc, state.hasDeadline);
+    ledRingSetLiveState(state.isLiveGw, state.isLiveGw);  // a live demo gameweek counts as a match in play
 
     char gwStateBuf[48];
     snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", state.isLiveGw ? "yes" : "no", state.nextGw);
     setSharedGwStateText(gwStateBuf);
-    setSharedFreshness(false, millis());
+    setSharedFreshness(state.stale, millis());
     updateSharedSquadFromPicks(state.picks, state.pickCount);
 }
 
@@ -4556,6 +5787,64 @@ static bool handleDisplayCommand(char **tokens, size_t tokenCount) {
     return false;
 }
 
+static void printDeviceHelp() {
+    Serial.println("\nDevice:");
+    Serial.println("  device                        WiFi, web UI address, firmware version");
+    Serial.println("  device setup                  restart as a WiFi access point for setup");
+    Serial.println("  device password clear         remove the web UI password");
+    Serial.println("  device restart");
+    Serial.println("  device off                    switch off (on battery; USB keeps it running)");
+    Serial.println("  device battery [<0-100>|auto] battery voltage; a percentage previews the icon");
+    Serial.println();
+}
+
+// Returns true if the line was a device command.
+static bool handleDeviceCommand(char **tokens, size_t tokenCount) {
+    if (strcmp(tokens[0], "device") != 0) {
+        return false;
+    }
+    if (tokenCount == 1) {
+        static DeviceConfig config;
+        deviceConfigGet(config);
+        Serial.printf("[DEVICE] firmware %s | entry %d | web password %s\n", FPL_FIRMWARE_VERSION, config.entryId,
+                      config.webPassword[0] ? "set" : "not set");
+        Serial.printf("[DEVICE] internal heap free %u, largest %u | web task stack unused %d\n",
+                      static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+                      webServerStackHighWaterMark());
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf("[DEVICE] WiFi '%s' %d dBm | web UI http://%s.local/ (http://%s/)\n", config.wifiSsid,
+                          WiFi.RSSI(), kWebHostname, WiFi.localIP().toString().c_str());
+        } else {
+            Serial.printf("[DEVICE] WiFi '%s' not connected\n", config.wifiSsid);
+        }
+    } else if (strcmp(tokens[1], "battery") == 0) {
+        if (tokenCount >= 3) {
+            batteryTestPercent = strcmp(tokens[2], "auto") == 0 ? -1 : constrain(atoi(tokens[2]), 0, 100);
+        }
+        const float volts = batteryVolts();
+        Serial.printf("[BAT] %.2f V now, %.2f V smoothed, ~%d%%%s\n", volts, batterySmoothedVolts,
+                      batteryPercent(batterySmoothedVolts),
+                      batteryTestPercent >= 0 ? " (icon previewing a test level)" : "");
+    } else if (strcmp(tokens[1], "setup") == 0) {
+        deviceConfigRequestSetupMode(true);
+        Serial.println("[DEVICE] restarting in setup mode");
+        delay(200);
+        ESP.restart();
+    } else if (strcmp(tokens[1], "password") == 0 && tokenCount >= 3 && strcmp(tokens[2], "clear") == 0) {
+        deviceConfigSetWebPassword("");
+        Serial.println("[DEVICE] web UI password removed");
+    } else if (strcmp(tokens[1], "restart") == 0) {
+        ESP.restart();
+    } else if (strcmp(tokens[1], "off") == 0) {
+        display.setBacklight(0);
+        powerOff();
+    } else {
+        printDeviceHelp();
+    }
+    return true;
+}
+
 static void handleSerialCommandLine(char *line) {
     if (!line) {
         return;
@@ -4573,9 +5862,27 @@ static void handleSerialCommandLine(char *line) {
     if (strcmp(tokens[0], "help") == 0 || strcmp(tokens[0], "?") == 0) {
         printDemoHelp();
         printDisplayHelp();
+        printDeviceHelp();
         return;
     }
-    if (handleDisplayCommand(tokens, tokenCount)) {
+    if (handleDisplayCommand(tokens, tokenCount) || handleDeviceCommand(tokens, tokenCount)) {
+        return;
+    }
+    if (strcmp(tokens[0], "fps") == 0) {
+        fpsRequested = true;
+        return;
+    }
+    if (strcmp(tokens[0], "screenshot") == 0) {
+        // screenshot [rank|graph|prices|watch|leagues|events|squad]
+        static const char *const kPages[] = {"rank", "graph", "prices", "watch", "leagues", "events", "squad", "squadend"};
+        int page = -1;
+        for (int i = 0; tokenCount > 1 && i < static_cast<int>(sizeof(kPages) / sizeof(kPages[0])); ++i) {
+            if (strcmp(tokens[1], kPages[i]) == 0) {
+                page = i;
+            }
+        }
+        screenshotPage = page;
+        screenshotRequested = true;
         return;
     }
 
@@ -4651,6 +5958,8 @@ static void handleSerialCommandLine(char *line) {
             demoState.seededGwPoints = snapshot.gwPoints;
             demoState.totalPoints = snapshot.overallPoints;
             demoState.seededTotalPoints = snapshot.overallPoints;
+            demoState.source = DemoSource::None;
+            demoState.pointsAdjust = 0;
             demoState.overallRank = rank;
             demoState.rankDiff = rankDiff;
             demoState.hasRankData = hasRankData;
@@ -4681,7 +5990,7 @@ static void handleSerialCommandLine(char *line) {
                 Serial.println("[DEMO] Run `demo seed` first");
                 return;
             }
-            demoState.enabled = true;
+            setDemoEnabledLocked(true);
             updated = demoState;
             xSemaphoreGive(demoMutex);
             publishDemoStateToUi(updated);
@@ -4691,12 +6000,10 @@ static void handleSerialCommandLine(char *line) {
         }
 
         if (strcmp(tokens[1], "off") == 0) {
-            if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+            if (!demoStop()) {
                 Serial.println("[DEMO] Failed: demo state mutex timeout");
                 return;
             }
-            demoState.enabled = false;
-            xSemaphoreGive(demoMutex);
             setSharedStatus("Demo mode off (live polling)", 0xFFCC66);
             Serial.println("[DEMO] disabled, live polling resumed");
             return;
@@ -4738,6 +6045,7 @@ static void handleSerialCommandLine(char *line) {
             }
             demoState.gwPoints = demoState.seededGwPoints;
             demoState.totalPoints = demoState.seededTotalPoints;
+            demoState.pointsAdjust = 0;
             updated = demoState;
             xSemaphoreGive(demoMutex);
 
@@ -4889,8 +6197,7 @@ static void handleSerialCommandLine(char *line) {
             return;
         }
         changedPick = *pick;
-        demoState.gwPoints = computeGwPointsFromPicks(demoState.picks, demoState.pickCount);
-        demoState.totalPoints = demoState.seededTotalPoints + (demoState.gwPoints - demoState.seededGwPoints);
+        demoRecomputePointsLocked();
         updated = demoState;
         xSemaphoreGive(demoMutex);
 
@@ -4943,10 +6250,8 @@ static void processSerialInput() {
     }
 }
 
-static UiMode determineAutoMode(const SharedUiState &state) {
-    if (currentMode == UiMode::EventsList || currentMode == UiMode::Squad || currentMode == UiMode::EventPopup) {
-        return currentMode;
-    }
+// The screen the gameweek state calls for, ignoring overlays (popup, events list, squad).
+static UiMode modeForGameweekState(const SharedUiState &state) {
     if (state.isLiveGw) {
         return UiMode::Live;
     }
@@ -4967,158 +6272,1020 @@ static UiMode determineAutoMode(const SharedUiState &state) {
     return UiMode::Idle;
 }
 
+static UiMode determineAutoMode(const SharedUiState &state) {
+    if (currentMode == UiMode::EventPopup) {
+        return currentMode;
+    }
+    return modeForGameweekState(state);
+}
+
 static void updateModeUi(const SharedUiState &state, const UiRuntimeState &runtime) {
-    char buf[96];
+    updateHomeScreen(state);
+    updateGameweekScreens(state, runtime);
 
-    if (ui.statusLabel) {
-        lv_label_set_text(ui.statusLabel, state.statusText);
-        lv_obj_set_style_text_color(ui.statusLabel, lv_color_hex(state.statusColor), LV_PART_MAIN);
-    }
-
-    if (ui.idleRankArrow && ui.idleRankValue) {
-        if (!state.hasRankData) {
-            lv_label_set_text(ui.idleRankArrow, "-");
-            lv_label_set_text(ui.idleRankValue, "--");
-            lv_obj_set_style_text_color(ui.idleRankArrow, lv_color_hex(kColorTextSecondary), LV_PART_MAIN);
-        } else {
-            lv_label_set_text(ui.idleRankArrow, state.rankDiff > 0 ? "^" : (state.rankDiff < 0 ? "v" : "-"));
-            lv_obj_set_style_text_color(ui.idleRankArrow,
-                                        lv_color_hex(state.rankDiff > 0 ? kColorAccentGreen :
-                                                     (state.rankDiff < 0 ? kColorAccentRed : kColorTextSecondary)),
-                                        LV_PART_MAIN);
-            formatNumberWithCommas(state.overallRank, buf, sizeof(buf));
-            lv_label_set_text(ui.idleRankValue, buf);
-        }
-    }
-
-    if (ui.idleGwPoints) {
-        snprintf(buf, sizeof(buf), "GW%d: %d pts", state.currentGw, state.gwPoints);
-        lv_label_set_text(ui.idleGwPoints, buf);
-    }
-    if (ui.idleTotalPoints) {
-        if (state.hasTotalPoints) {
-            char totalBuf[24];
-            formatNumberWithCommas(state.totalPoints, totalBuf, sizeof(totalBuf));
-            snprintf(buf, sizeof(buf), "%s total pts", totalBuf);
-        } else {
-            strlcpy(buf, "-- total pts", sizeof(buf));
-        }
-        lv_label_set_text(ui.idleTotalPoints, buf);
-    }
-
-    if (ui.deadlineCountdown && state.hasNextDeadline) {
-        const time_t now = time(nullptr);
-        int64_t sec = now > 100000 ? (static_cast<int64_t>(state.nextDeadlineUtc) - static_cast<int64_t>(now)) : 0;
-        if (sec < 0) {
-            sec = 0;
-        }
-        const int hours = static_cast<int>(sec / 3600);
-        const int mins = static_cast<int>((sec % 3600) / 60);
-        const int secs = static_cast<int>(sec % 60);
-        if (millis() - lastDeadlineBlinkMs >= 500) {
-            deadlineColonVisible = !deadlineColonVisible;
-            lastDeadlineBlinkMs = millis();
-        }
-        snprintf(buf, sizeof(buf), "%02d%c%02d%c%02d", hours, deadlineColonVisible ? ':' : ' ', mins,
-                 deadlineColonVisible ? ':' : ' ', secs);
-        lv_label_set_text(ui.deadlineCountdown, buf);
-        snprintf(buf, sizeof(buf), "Gameweek %d", state.hasNextGw ? state.nextGw : 0);
-        lv_label_set_text(ui.deadlineMeta, buf);
-    }
-
-    if (ui.finalCountdown && state.hasNextDeadline) {
-        const time_t now = time(nullptr);
-        int64_t sec = now > 100000 ? (static_cast<int64_t>(state.nextDeadlineUtc) - static_cast<int64_t>(now)) : 0;
-        if (sec < 0) {
-            sec = 0;
-        }
-        if (sec > 3600) {
-            sec = 3600;
-        }
-        snprintf(buf, sizeof(buf), "%02d:%02d", static_cast<int>(sec / 60), static_cast<int>(sec % 60));
-        lv_label_set_text(ui.finalCountdown, buf);
-    }
-
-    if (ui.liveTitle) {
-        snprintf(buf, sizeof(buf), "GW%d LIVE", state.currentGw);
-        lv_label_set_text(ui.liveTitle, buf);
-    }
-    if (ui.livePoints) {
-        snprintf(buf, sizeof(buf), "%d\npoints", state.gwPoints);
-        lv_label_set_text(ui.livePoints, buf);
-    }
-    if (ui.liveRank) {
-        if (state.hasRankData) {
-            char rankBuf[24];
-            formatNumberWithCommas(state.overallRank, rankBuf, sizeof(rankBuf));
-            snprintf(buf, sizeof(buf), "%s %s", state.rankDiff >= 0 ? "^" : "v", rankBuf);
-            lv_label_set_text(ui.liveRank, buf);
-            lv_obj_set_style_text_color(ui.liveRank, lv_color_hex(state.rankDiff >= 0 ? kColorAccentGreen : kColorAccentRed),
-                                        LV_PART_MAIN);
-        } else {
-            lv_label_set_text(ui.liveRank, "live rank --");
-        }
-    }
-    if (ui.liveDot) {
-        const bool pulseOn = ((millis() / 750U) % 2U) == 0U;
-        lv_obj_set_style_bg_color(ui.liveDot, lv_color_hex(state.isStale ? kColorAccentAmber : kColorAccentCyan), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(ui.liveDot, state.isStale ? LV_OPA_80 : (pulseOn ? LV_OPA_COVER : LV_OPA_30), LV_PART_MAIN);
-    }
-
-    if (ui.liveTickerLabel) {
-        if (runtime.recentEventCount == 0) {
-            lv_label_set_text(ui.liveTickerLabel, "No events yet");
-        } else {
-            if (millis() - lastTickerRotateMs > 3000U) {
-                tickerEventIndex = (tickerEventIndex + 1) % runtime.recentEventCount;
-                lastTickerRotateMs = millis();
-            }
-            const UiEventItem &e = runtime.recentEvents[(runtime.recentEventCount - 1) - tickerEventIndex];
-            snprintf(buf, sizeof(buf), "%s %s %+d", e.icon, e.player, e.delta);
-            lv_label_set_text(ui.liveTickerLabel, buf);
-        }
-    }
-
-    if (currentMode == UiMode::EventsList && renderedEventsVersion != runtime.eventVersion) {
+    if (currentMode == UiMode::Live && livePage == LivePage::Events && renderedEventsVersion != runtime.eventVersion) {
         refreshEventsList(runtime);
         renderedEventsVersion = runtime.eventVersion;
     }
-    if (currentMode == UiMode::Squad && renderedSquadVersion != runtime.squadVersion) {
+    if (currentMode == UiMode::Live && livePage == LivePage::Squad && renderedSquadVersion != runtime.squadVersion) {
         refreshSquadList(runtime);
         renderedSquadVersion = runtime.squadVersion;
     }
 }
 
 static void showPopupEvent(const UiEventItem &event) {
-    if (ui.popupTitle) {
-        lv_label_set_text(ui.popupTitle, event.label[0] ? event.label : "event");
-        lv_obj_set_style_text_color(ui.popupTitle, lv_color_hex(event.delta >= 0 ? kColorAccentGreen : kColorAccentRed), LV_PART_MAIN);
-    }
-    if (ui.popupPlayer) {
-        lv_label_set_text(ui.popupPlayer, event.player);
-    }
-    if (ui.popupDelta) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%+d pts", event.delta);
-        lv_label_set_text(ui.popupDelta, buf);
-        lv_obj_set_style_text_color(ui.popupDelta, lv_color_hex(event.delta >= 0 ? kColorAccentGreen : kColorAccentRed), LV_PART_MAIN);
-    }
-    if (ui.popupTotal) {
-        char buf[40];
-        snprintf(buf, sizeof(buf), "%d -> %d total", event.totalBefore, event.totalAfter);
-        lv_label_set_text(ui.popupTotal, buf);
-    }
-    if (ui.popupKit) {
-        if (resolveAndLoadKitImage(event)) {
-            lv_obj_clear_flag(ui.popupKit, LV_OBJ_FLAG_HIDDEN);
-            lv_image_set_src(ui.popupKit, &kitImageDsc);
-        } else {
-            lv_obj_add_flag(ui.popupKit, LV_OBJ_FLAG_HIDDEN);
-        }
-    }
+    fillPopup(event);
     loadMode(UiMode::EventPopup, LV_SCR_LOAD_ANIM_FADE_ON);
     ledRingTriggerNotificationForMs(kPopupDisplayDurationMs);
     popupHideAtMs = millis() + kPopupDisplayDurationMs;
+}
+
+// ---------------------------------------------------------------------------
+// Web demo (the Demo tab at http://fpl-buddy.local)
+// Drives the display from made-up FPL data so any screen can be shown on demand, e.g. for filming: the
+// between-gameweeks carousel, deadline countdowns, the live gameweek, point popups, rank moves and stale data.
+// It publishes through the same shared state as a real poll, so the screens and the LED ring behave as they do
+// on a matchday. FPL polling pauses while it runs. Commands arrive on the web task; anything that touches LVGL
+// is handed to uiTask through demoState.screenRequest.
+// ---------------------------------------------------------------------------
+enum class DemoScreen : int8_t { Live = 0, Events, Squad, Rank, Graph, Prices, Watchlist, Leagues, Next };
+static const char *const kDemoScreenNames[] = {"live",   "events",    "squad",   "rank", "graph",
+                                               "prices", "watchlist", "leagues", "next"};
+
+static constexpr time_t kDemoIdleDeadlineSec = 3 * 24 * 3600;  // "between gameweeks": next deadline in 3 days
+static constexpr time_t kDemoNextDeadlineSec = 7 * 24 * 3600;  // next deadline after kick-off
+static constexpr time_t kDemoKickoffDelaySec = 2;               // deadline passed -> live, like the next poll
+static constexpr int32_t kDemoMaxDeadlineSec = 30 * 24 * 3600;
+static constexpr int kDemoMaxRank = 12000000;
+static constexpr int kDemoDefaultRank = 184392;
+static constexpr int kDemoSampleElementBase = 90001;
+
+static IdleScreensData *demoRealIdle = nullptr;   // PSRAM; the real between-gameweeks data, restored at stop
+static volatile bool demoIdleOverridden = false;  // idleScreensData holds demo data (set under idleScreensMutex)
+
+struct DemoSamplePlayer {
+    const char *name;
+    const char *team;  // kit slug
+    uint8_t elementType;
+    uint8_t cost;  // tenths of a million
+};
+// "Start with sample team": 1-3-4-3, captain Haaland (slot 9), vice captain Salah (slot 5).
+static const DemoSamplePlayer kDemoSampleSquad[] = {
+    {"Raya", "arsenal", 1, 60},         {"Gabriel", "arsenal", 2, 65},     {"Virgil", "liverpool", 2, 60},
+    {"Gvardiol", "man_city", 2, 60},    {"M.Salah", "liverpool", 3, 140},  {"Palmer", "chelsea", 3, 105},
+    {"Saka", "arsenal", 3, 100},        {"B.Fernandes", "man_utd", 3, 90}, {"Haaland", "man_city", 4, 145},
+    {"Watkins", "aston_villa", 4, 90},  {"Isak", "liverpool", 4, 105},     {"Pickford", "everton", 1, 55},
+    {"Munoz", "crystal_palace", 2, 55}, {"Gordon", "newcastle", 3, 75},    {"Mbeumo", "man_utd", 3, 80},
+};
+static constexpr int kDemoSampleCaptainSlot = 9;
+static constexpr int kDemoSampleViceSlot = 5;
+
+// The sample squad's finished gameweek, applied silently (59 points).
+struct DemoSampleReturn {
+    uint8_t slot;
+    const char *type;
+    uint8_t count;
+};
+static const DemoSampleReturn kDemoSampleReturns[] = {
+    {1, "cs", 1},     {1, "save", 3}, {2, "cs", 1},    {3, "cs", 1},  {5, "assist", 1},
+    {6, "goal", 1},   {9, "goal", 1}, {9, "bonus", 3}, {13, "cs", 1},
+};
+
+struct DemoSampleLeague {
+    const char *name;
+    int rank;
+    int lastRank;
+    int size;
+};
+// Used when the real entry has no mini leagues (or there is no FPL data yet).
+static const DemoSampleLeague kDemoSampleLeagues[] = {
+    {"Office League", 3, 5, 14}, {"Family & Friends", 1, 2, 8}, {"Sunday League Lads", 7, 4, 12}, {"Uni Mates", 2, 2, 10},
+};
+
+// Web event types -> applyDemoEventToPick types. A count of 0 means one defensive-contribution award.
+struct DemoEventType {
+    const char *name;
+    const char *applyAs;
+    int count;
+};
+static const DemoEventType kDemoEventTypes[] = {
+    {"goal", "goal", 1}, {"assist", "assist", 1}, {"cs", "cs", 1},         {"save", "save", 3},
+    {"psave", "pen_save", 1}, {"dc", "dc", 0}, {"bonus", "bonus", 3},       {"concede", "concede", 2},
+    {"yc", "yc", 1},     {"rc", "rc", 1},         {"og", "og", 1},          {"pmiss", "pen_miss", 1},
+};
+
+static bool demoClockValid(time_t &now) {
+    now = time(nullptr);
+    return now >= kMinValidEpoch;
+}
+
+static int demoClampRank(int64_t rank) {
+    return rank < 1 ? 1 : (rank > kDemoMaxRank ? kDemoMaxRank : static_cast<int>(rank));
+}
+
+static uint32_t demoRandom(uint32_t &seed) {
+    seed = seed * 1664525U + 1013904223U;
+    return seed >> 8;
+}
+
+// Next FPL price update, which runs at about 01:30 UK time.
+static bool demoNextPriceUpdate(time_t &out) {
+    time_t now = 0;
+    if (!demoClockValid(now)) {
+        return false;
+    }
+    struct tm local;
+    localtime_r(&now, &local);
+    local.tm_hour = 1;
+    local.tm_min = 30;
+    local.tm_sec = 0;
+    time_t at = mktime(&local);
+    if (at <= now) {
+        at += 24 * 3600;
+    }
+    out = at;
+    return true;
+}
+
+static int demoPlayerCost(const TeamPick &pick, const IdleScreensData &real) {
+    for (size_t i = 0; i < real.prices.squadCount; ++i) {
+        if (real.prices.squad[i].elementId == pick.elementId) {
+            return real.prices.squad[i].nowCost;
+        }
+    }
+    const int sampleIndex = pick.elementId - kDemoSampleElementBase;
+    if (sampleIndex >= 0 && sampleIndex < static_cast<int>(sizeof(kDemoSampleSquad) / sizeof(kDemoSampleSquad[0]))) {
+        return kDemoSampleSquad[sampleIndex].cost;
+    }
+    static const int kByType[] = {50, 50, 50, 70, 75};
+    return kByType[(pick.elementType >= 0 && pick.elementType <= 4) ? pick.elementType : 0];
+}
+
+// Between-gameweeks screens for the demo: a rank history ending at the demo rank, price changes for the demo
+// squad and the watchlist (a rise, a fall, a hold and a lock, so every state shows), and the real mini leagues
+// (or sample ones). Caller holds demoMutex.
+static void publishDemoIdleScreensLocked() {
+    static DisplaySettings settings;  // guarded by demoMutex
+    displaySettingsGet(settings);
+    if (!idleScreensMutex || xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return;
+    }
+    IdleScreensData &d = *idleScreensData;
+    const IdleScreensData &real = *demoRealIdle;
+    const DemoState &s = demoState;
+
+    // Rank history: the last finished gameweek ends at the demo rank (the kick-off rank while live), the one
+    // before it at the rank before the latest move, and earlier gameweeks wander (the same way every time).
+    RankHistory &h = d.history;
+    h.count = 0;
+    const int lastGw = s.isLiveGw ? s.currentGw - 1 : s.currentGw;
+    if (lastGw > 0) {
+        const size_t count = lastGw < static_cast<int>(kMaxGameweeks) ? static_cast<size_t>(lastGw) : kMaxGameweeks;
+        uint32_t seed = 0x2545F491U + static_cast<uint32_t>(lastGw);
+        int64_t rank = s.isLiveGw ? static_cast<int64_t>(s.overallRank) + s.rankDiff : s.overallRank;
+        for (size_t i = count; i-- > 0;) {
+            h.gw[i] = lastGw - static_cast<int>(count - 1 - i);
+            h.overallRank[i] = demoClampRank(rank);
+            if (i == count - 1 && !s.isLiveGw) {
+                rank = static_cast<int64_t>(s.overallRank) + s.rankDiff;
+            } else {
+                rank = rank * (85 + static_cast<int64_t>(demoRandom(seed) % 50)) / 100;
+            }
+        }
+        h.count = count;
+    }
+    d.hasHistory = h.count > 0;
+
+    PriceData &prices = d.prices;
+    prices.hasNextUpdate = demoNextPriceUpdate(prices.nextUpdateUtc);
+    prices.squadCount = 0;
+    bool midRiser = false;
+    bool benchFaller = false;
+    for (size_t i = 0; i < s.pickCount && prices.squadCount < sizeof(prices.squad) / sizeof(prices.squad[0]); ++i) {
+        const TeamPick &pick = s.picks[i];
+        PlayerPrice &p = prices.squad[prices.squadCount++];
+        p = PlayerPrice();
+        p.elementId = pick.elementId;
+        sanitizeUtf8ToAscii(pick.playerName.c_str(), p.name, sizeof(p.name));
+        strlcpy(p.team, pick.teamShortName, sizeof(p.team));
+        p.isGk = pick.elementType == 1;
+        p.nowCost = demoPlayerCost(pick, real);
+        // A rise for the captain and a starting midfielder, a fall for a benched outfielder; the rest hold.
+        if (pick.isCaptain) {
+            p.projectedPct = 1034;
+        } else if (!midRiser && pick.elementType == 3 && pick.squadPosition <= 11) {
+            p.projectedPct = 1008;
+            midRiser = true;
+        } else if (!benchFaller && pick.squadPosition > 11 && pick.elementType != 1) {
+            p.projectedPct = -1012;
+            benchFaller = true;
+        } else {
+            p.projectedPct = static_cast<int>((i * 373) % 1400) - 700;
+        }
+    }
+
+    static const int kWatchPct[] = {1015, 420, -1006, 230};
+    prices.watchCount = 0;
+    for (size_t i = 0; i < settings.watchCount && prices.watchCount < kMaxWatchlist; ++i) {
+        PlayerPrice &p = prices.watch[prices.watchCount++];
+        p = PlayerPrice();
+        const PlayerPrice *match = nullptr;
+        for (size_t j = 0; j < real.prices.watchCount && !match; ++j) {
+            if (watchEntryMatches(settings.watchlist[i], real.prices.watch[j].elementId, real.prices.watch[j].name)) {
+                match = &real.prices.watch[j];
+            }
+        }
+        if (match) {
+            p = *match;
+        } else {
+            // No FPL data for this player yet: show the watchlist entry, "saka" -> "Saka".
+            strlcpy(p.name, settings.watchlist[i], sizeof(p.name));
+            if (p.name[0] >= 'a' && p.name[0] <= 'z') {
+                p.name[0] = static_cast<char>(p.name[0] - 'a' + 'A');
+            }
+            p.nowCost = 60 + 5 * static_cast<int>(i);
+        }
+        p.projectedPct = kWatchPct[i % 4];
+        p.locked = (i % 4) == 3;
+    }
+    d.hasPrices = true;
+
+    if (real.hasLeagues && real.leagueCount > 0) {
+        d.leagueCount = real.leagueCount;
+        for (size_t i = 0; i < real.leagueCount; ++i) {
+            d.leagues[i] = real.leagues[i];
+        }
+    } else {
+        d.leagueCount = sizeof(kDemoSampleLeagues) / sizeof(kDemoSampleLeagues[0]);
+        for (size_t i = 0; i < d.leagueCount; ++i) {
+            MiniLeague &lg = d.leagues[i];
+            lg = MiniLeague();
+            lg.id = 900001 + static_cast<int>(i);
+            strlcpy(lg.name, kDemoSampleLeagues[i].name, sizeof(lg.name));
+            lg.rank = kDemoSampleLeagues[i].rank;
+            lg.lastRank = kDemoSampleLeagues[i].lastRank;
+            lg.size = kDemoSampleLeagues[i].size;
+        }
+    }
+    d.hasLeagues = true;
+    d.version++;
+    demoIdleOverridden = true;
+    xSemaphoreGive(idleScreensMutex);
+}
+
+// Shows the demo on the display, with the status line a real poll would leave. Caller holds demoMutex.
+static void publishDemoLocked() {
+    publishDemoStateToUi(demoState);
+    publishDemoIdleScreensLocked();
+    if (demoState.stale) {
+        setSharedStatus("FPL fetch failed", 0xFF5A5A);
+    } else {
+        setSharedStatus("FPL updated", 0x38D39F);
+    }
+}
+
+// Caller holds demoMutex.
+static void demoSeedSampleLocked() {
+    DemoState &s = demoState;
+    const size_t count = sizeof(kDemoSampleSquad) / sizeof(kDemoSampleSquad[0]);
+    static const char *const kPositionNames[] = {"", "GKP", "DEF", "MID", "FWD"};
+    int delta = 0;
+    const char *label = nullptr;
+    for (size_t i = 0; i < count; ++i) {
+        const DemoSamplePlayer &src = kDemoSampleSquad[i];
+        TeamPick &p = s.picks[i];
+        p = TeamPick();
+        p.elementId = kDemoSampleElementBase + static_cast<int>(i);
+        p.squadPosition = static_cast<int>(i) + 1;
+        p.isCaptain = p.squadPosition == kDemoSampleCaptainSlot;
+        p.isViceCaptain = p.squadPosition == kDemoSampleViceSlot;
+        p.multiplier = p.squadPosition > 11 ? 0 : (p.isCaptain ? 2 : 1);
+        p.elementType = src.elementType;
+        p.playerName = src.name;
+        p.positionName = kPositionNames[src.elementType];
+        strlcpy(p.teamShortName, src.team, sizeof(p.teamShortName));
+        if (p.squadPosition <= 11) {
+            applyDemoEventToPick(p, "mins", 90, delta, label);
+        }
+    }
+    s.pickCount = count;
+    for (const DemoSampleReturn &r : kDemoSampleReturns) {
+        if (TeamPick *p = findPickBySquadSlot(s.picks, s.pickCount, r.slot)) {
+            applyDemoEventToPick(*p, r.type, r.count, delta, label);
+        }
+    }
+}
+
+// Seeds the demo from the FPL cache (your team, as last polled) or the sample squad. Caller holds fplDataMutex
+// and demoMutex.
+static void demoSeedLocked(DemoSource source) {
+    DemoState &s = demoState;
+    const FplDataCache &c = *fplCache;
+    time_t now = 0;
+    const bool clockValid = demoClockValid(now);
+    s.pointsAdjust = 0;
+    if (source == DemoSource::MyTeam) {
+        s.pickCount = c.pickCount;
+        for (size_t i = 0; i < c.pickCount; ++i) {
+            s.picks[i] = c.picks[i];
+        }
+        s.currentGw = c.entry.currentGw > 0 ? c.entry.currentGw : 1;
+        s.isLiveGw = c.hasGwState && c.gwState.isLiveGw;
+        s.nextGw = c.hasGwState ? c.gwState.nextGw : 0;
+        s.hasNextGw = s.nextGw > 0;
+        s.hasDeadline = c.hasGwState && c.gwState.hasDeadline;
+        s.deadlineUtc = c.gwState.deadlineUtc;
+        s.overallRank = c.entry.overallRank;
+        s.rankDiff = (c.entry.overallRank > 0 && c.entry.previousOverallRank > 0)
+                         ? c.entry.previousOverallRank - c.entry.overallRank
+                         : 0;
+        s.gwPoints = computeGwPointsFromPicks(s.picks, s.pickCount);
+        s.totalPoints = c.entry.overallPoints;
+    } else {
+        const int gw = (c.hasEntry && c.entry.currentGw > 0) ? c.entry.currentGw : 7;
+        demoSeedSampleLocked();
+        s.currentGw = gw;
+        s.isLiveGw = false;
+        s.nextGw = gw < 38 ? gw + 1 : 0;
+        s.hasNextGw = s.nextGw > 0;
+        s.hasDeadline = s.hasNextGw && clockValid;
+        s.deadlineUtc = now + kDemoIdleDeadlineSec;
+        s.overallRank = kDemoDefaultRank;
+        s.rankDiff = 46613;
+        s.gwPoints = computeGwPointsFromPicks(s.picks, s.pickCount);
+        s.totalPoints = s.gwPoints + 55 * (gw - 1);
+    }
+    if (s.overallRank <= 0) {  // a new team with no rank yet
+        s.overallRank = kDemoDefaultRank;
+        s.rankDiff = 0;
+    }
+    s.hasRankData = true;
+    s.seededGwPoints = s.gwPoints;
+    s.seededTotalPoints = s.totalPoints;
+    for (size_t i = 0; i < s.pickCount; ++i) {
+        s.seededPicks[i] = s.picks[i];
+    }
+    s.seeded = true;
+    s.source = source;
+    s.stale = false;
+    s.screenRequest = -1;
+}
+
+// The next gameweek goes live with no points yet. Caller holds demoMutex.
+static void demoKickoffLocked(time_t now) {
+    DemoState &s = demoState;
+    s.currentGw = (s.hasNextGw && s.nextGw > 0) ? s.nextGw : s.currentGw + 1;
+    if (s.currentGw > 38) {
+        s.currentGw = 1;
+    }
+    s.nextGw = s.currentGw < 38 ? s.currentGw + 1 : 0;
+    s.hasNextGw = s.nextGw > 0;
+    s.isLiveGw = true;
+    s.hasDeadline = s.hasNextGw;
+    s.deadlineUtc = now + kDemoNextDeadlineSec;
+    for (size_t i = 0; i < s.pickCount; ++i) {
+        s.picks[i].live = TeamPick::LiveStats();
+    }
+    s.pointsAdjust = 0;
+    s.seededTotalPoints = s.totalPoints;
+    s.seededGwPoints = 0;
+    demoRecomputePointsLocked();
+    s.rankDiff = 0;
+    clearUiEvents();
+}
+
+// Caller holds demoMutex.
+static void demoEndGameweekLocked() {
+    DemoState &s = demoState;
+    s.isLiveGw = false;
+    s.nextGw = s.currentGw < 38 ? s.currentGw + 1 : 1;
+    s.hasNextGw = true;
+}
+
+// Moves the overall rank for `points` gained (or lost) by the squad: about 1.5% per point. Caller holds
+// demoMutex.
+static void demoMoveRankLocked(int points) {
+    DemoState &s = demoState;
+    if (points == 0 || s.overallRank <= 0) {
+        return;
+    }
+    float factor = 1.0f - 0.015f * static_cast<float>(points);
+    factor = factor < 0.6f ? 0.6f : (factor > 1.4f ? 1.4f : factor);
+    int next = demoClampRank(static_cast<int64_t>(static_cast<float>(s.overallRank) * factor + 0.5f));
+    if (next == s.overallRank) {
+        next = demoClampRank(static_cast<int64_t>(next) + (points > 0 ? -1 : 1));
+    }
+    s.rankDiff += s.overallRank - next;
+    s.overallRank = next;
+}
+
+// Applies a scoring event to a demo player and queues the popups a live poll would show, with "PLAYING!" and
+// "60+ mins!" first when the event implies them. `effectiveOut` is the change in the squad's points (after the
+// multiplier). Returns false, leaving the player unchanged, for an unknown event or one that scores nothing for
+// this player. Caller holds demoMutex.
+static bool demoApplyPlayerEvent(TeamPick &pick, const char *type, int count, int &effectiveOut, const char *&error) {
+    struct Step {
+        int delta;
+        int totalAfter;
+        const char *label;
+    };
+    Step steps[3];
+    size_t stepCount = 0;
+    const TeamPick::LiveStats before = pick.live;
+    auto apply = [&](const char *applyAs, int n, const char *label) {
+        int delta = 0;
+        const char *defaultLabel = nullptr;
+        applyDemoEventToPick(pick, applyAs, n, delta, defaultLabel);
+        if (delta != 0 && stepCount < 3) {
+            steps[stepCount++] = {delta, pick.live.totalPoints, label ? label : defaultLabel};
+        }
+        return delta;
+    };
+
+    const bool playing = strcmp(type, "playing") == 0;
+    const bool sixty = strcmp(type, "sixty") == 0;
+    const DemoEventType *event = nullptr;
+    for (const DemoEventType &e : kDemoEventTypes) {
+        if (strcmp(type, e.name) == 0) {
+            event = &e;
+        }
+    }
+    if (!playing && !sixty && !event) {
+        error = "Unknown event";
+        return false;
+    }
+
+    int mainDelta = 0;
+    if (pick.live.minutes < 1) {
+        mainDelta = apply("mins", 1, "PLAYING!");
+    }
+    if ((sixty || (event && strcmp(event->name, "cs") == 0)) && pick.live.minutes < 60) {
+        mainDelta = apply("mins", 60 - pick.live.minutes, "60+ mins!");
+    }
+    if (event) {
+        int n = (count > 0 && count <= 10) ? count : event->count;
+        if (n <= 0) {
+            n = defensiveContributionThresholdForElementType(pick.elementType);
+            n = n > 0 ? n : 1;
+        }
+        mainDelta = apply(event->applyAs, n, nullptr);
+    }
+    if (mainDelta == 0) {
+        pick.live = before;
+        error = playing ? "Already playing" : (sixty ? "Already past 60 minutes" : "That scores no points for this player");
+        return false;
+    }
+
+    int total = 0;
+    for (size_t i = 0; i < stepCount; ++i) {
+        total += steps[i].delta;
+        pushPickEvent(pick, steps[i].delta, steps[i].label, steps[i].totalAfter);
+    }
+    effectiveOut = total * pick.multiplier;
+    return true;
+}
+
+// Starts (or restarts) the demo. Web task.
+static bool demoStart(DemoSource source, const char *&error) {
+    if (!demoMutex || !fplDataMutex || xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        error = "Busy, try again";
+        return false;
+    }
+    // Take over the display first: fplTask stops publishing once it sees the flag, and taking the cache below
+    // waits out a poll that is already running.
+    const bool wasEnabled = demoState.enabled;
+    setDemoEnabledLocked(true);
+    xSemaphoreGive(demoMutex);
+
+    auto fail = [&](const char *message) {
+        if (!wasEnabled && xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            setDemoEnabledLocked(false);
+            xSemaphoreGive(demoMutex);
+            fplPollRequested = true;  // a poll may have skipped the display while the flag was set
+        }
+        error = message;
+        return false;
+    };
+    if (xSemaphoreTake(fplDataMutex, pdMS_TO_TICKS(20000)) != pdTRUE) {
+        return fail("An FPL update is running, try again");
+    }
+    if (source == DemoSource::MyTeam && !(fplCache->hasEntry && fplCache->pickCount > 0)) {
+        xSemaphoreGive(fplDataMutex);
+        return fail("No FPL data yet: wait for the first update, or use the sample team");
+    }
+    if (xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        xSemaphoreGive(fplDataMutex);
+        return fail("Busy, try again");
+    }
+    if (!demoIdleOverridden && xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        *demoRealIdle = *idleScreensData;
+        xSemaphoreGive(idleScreensMutex);
+    }
+    demoSeedLocked(source);
+    xSemaphoreGive(fplDataMutex);
+    clearUiEvents();
+    publishDemoLocked();
+    Serial.printf("[DEMO] started with %s: GW%d %s, %d pts, rank %d\n",
+                  source == DemoSource::Sample ? "the sample team" : "my team", demoState.currentGw,
+                  demoState.isLiveGw ? "live" : "finished", demoState.gwPoints, demoState.overallRank);
+    xSemaphoreGive(demoMutex);
+    return true;
+}
+
+// Ends the demo; fplTask then shows the cached FPL data and polls. False if the demo state is busy.
+static bool demoStop() {
+    if (!demoMutex || xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        return false;
+    }
+    const bool wasEnabled = demoState.enabled;
+    setDemoEnabledLocked(false);
+    demoState.stale = false;
+    demoState.screenRequest = -1;
+    xSemaphoreGive(demoMutex);
+
+    demoCarouselPaused = false;
+    if (demoIdleOverridden && xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        const uint32_t version = idleScreensData->version;
+        *idleScreensData = *demoRealIdle;
+        idleScreensData->version = version + 1;
+        demoIdleOverridden = false;
+        xSemaphoreGive(idleScreensMutex);
+    }
+    if (wasEnabled) {
+        clearUiEvents();
+        setSharedStatus("Fetching FPL points...", 0xFFCC66);
+        Serial.println("[DEMO] stopped, live polling resumed");
+    }
+    return true;
+}
+
+// A command other than start/restart/stop. Caller holds demoMutex; the demo is running.
+static bool demoCommandLocked(const char *action, JsonObjectConst cmd, const char *&error) {
+    DemoState &s = demoState;
+    time_t now = 0;
+    const bool clockValid = demoClockValid(now);
+
+    if (strcmp(action, "screen") == 0) {
+        const char *name = cmd["screen"] | "";
+        for (size_t i = 0; i < sizeof(kDemoScreenNames) / sizeof(kDemoScreenNames[0]); ++i) {
+            if (strcmp(name, kDemoScreenNames[i]) == 0) {
+                s.screenRequest = static_cast<int>(i);
+                return true;
+            }
+        }
+        error = "Unknown screen";
+        return false;
+    }
+
+    if (strcmp(action, "phase") == 0) {
+        const char *phase = cmd["phase"] | "";
+        if (!clockValid) {
+            error = "The clock is not synced yet";
+            return false;
+        }
+        if (strcmp(phase, "live") == 0) {
+            if (!s.isLiveGw) {
+                demoKickoffLocked(now);
+            }
+        } else if (strcmp(phase, "idle") == 0 || strcmp(phase, "deadline") == 0) {
+            const int32_t seconds = phase[0] == 'i' ? static_cast<int32_t>(kDemoIdleDeadlineSec) : (cmd["seconds"] | -1);
+            if (seconds < 0 || seconds > kDemoMaxDeadlineSec) {
+                error = "The deadline must be 0 seconds to 30 days away";
+                return false;
+            }
+            if (s.isLiveGw) {
+                demoEndGameweekLocked();
+            }
+            if (!s.hasNextGw) {
+                s.nextGw = s.currentGw < 38 ? s.currentGw + 1 : 1;
+                s.hasNextGw = true;
+            }
+            s.hasDeadline = true;
+            s.deadlineUtc = now + seconds;
+        } else {
+            error = "Unknown phase";
+            return false;
+        }
+        publishDemoLocked();
+        return true;
+    }
+
+    if (strcmp(action, "set") == 0) {
+        // Validate everything before changing anything.
+        const int gw = cmd["gw"] | s.currentGw;
+        const int gwPoints = cmd["gwPoints"] | s.gwPoints;
+        const int totalPoints = cmd["totalPoints"] | s.totalPoints;
+        const int rank = cmd["rank"] | s.overallRank;
+        const int rankDiff = cmd["rankDiff"] | s.rankDiff;
+        if (gw < 1 || gw > 38) {
+            error = "The gameweek must be 1-38";
+            return false;
+        }
+        if (gwPoints < -99 || gwPoints > 999 || totalPoints < 0 || totalPoints > 9999) {
+            error = "Points out of range";
+            return false;
+        }
+        if (rank < 1 || rank > kDemoMaxRank || rankDiff < -kDemoMaxRank || rankDiff > kDemoMaxRank) {
+            error = "Rank out of range";
+            return false;
+        }
+
+        if (cmd.containsKey("carouselPaused")) {
+            demoCarouselPaused = cmd["carouselPaused"] | false;
+        }
+        s.autoKickoff = cmd["autoKickoff"] | s.autoKickoff;
+        s.rankFollowsPoints = cmd["rankFollows"] | s.rankFollowsPoints;
+        const bool stale = cmd["stale"] | s.stale;
+        const bool dataChanged = gw != s.currentGw || gwPoints != s.gwPoints || totalPoints != s.totalPoints ||
+                                 rank != s.overallRank || rankDiff != s.rankDiff || stale != s.stale;
+        if (!dataChanged) {
+            return true;
+        }
+        if (gw != s.currentGw) {
+            s.currentGw = gw;
+            s.nextGw = gw < 38 ? gw + 1 : 1;
+            s.hasNextGw = true;
+        }
+        if (gwPoints != s.gwPoints) {
+            s.pointsAdjust += gwPoints - s.gwPoints;
+            demoRecomputePointsLocked();
+        }
+        if (totalPoints != s.totalPoints) {
+            s.seededTotalPoints += totalPoints - s.totalPoints;
+            s.totalPoints = totalPoints;
+        }
+        s.overallRank = rank;
+        s.rankDiff = rankDiff;
+        s.hasRankData = true;
+        s.stale = stale;
+        publishDemoLocked();
+        return true;
+    }
+
+    if (strcmp(action, "event") == 0) {
+        TeamPick *pick = findPickBySquadSlot(s.picks, s.pickCount, cmd["slot"] | 0);
+        if (!pick) {
+            error = "Unknown player";
+            return false;
+        }
+        int effective = 0;
+        if (!demoApplyPlayerEvent(*pick, cmd["type"] | "", cmd["count"] | 0, effective, error)) {
+            return false;
+        }
+        if (s.rankFollowsPoints) {
+            demoMoveRankLocked(effective);
+        }
+        demoRecomputePointsLocked();
+        publishDemoLocked();
+        return true;
+    }
+
+    if (strcmp(action, "clearScores") == 0) {
+        for (size_t i = 0; i < s.pickCount; ++i) {
+            s.picks[i].live = TeamPick::LiveStats();
+        }
+        s.pointsAdjust = 0;
+        demoRecomputePointsLocked();
+        clearUiEvents();
+        publishDemoLocked();
+        return true;
+    }
+
+    error = "Unknown action";
+    return false;
+}
+
+// uiTask: shows a screen the web UI asked for. Each carousel's pages only show in its part of the gameweek
+// (events and squad while it is live, prices and watchlist between gameweeks), and only when they have something
+// to show.
+static void demoShowScreen(DemoScreen screen) {
+    if (currentMode == UiMode::EventPopup) {
+        SharedUiState state;
+        if (!readSharedUiState(state)) {
+            return;
+        }
+        popupHideAtMs = 0;
+        loadMode(modeForGameweekState(state), LV_SCR_LOAD_ANIM_FADE_ON);
+    }
+    if (currentMode == UiMode::Live) {
+        LivePage page = LivePage::Main;
+        switch (screen) {
+            case DemoScreen::Next: advanceLivePage(); return;
+            case DemoScreen::Events: page = LivePage::Events; break;
+            case DemoScreen::Squad: page = LivePage::Squad; break;
+            case DemoScreen::Leagues: page = LivePage::Leagues; break;
+            case DemoScreen::Graph: page = LivePage::RankGraph; break;
+            default: break;
+        }
+        if (livePageAvailable(page)) {
+            carouselSubPage = 0;
+            showLivePage(page);
+        }
+        return;
+    }
+    if (screen == DemoScreen::Live || currentMode != UiMode::Idle) {
+        return;
+    }
+    if (screen == DemoScreen::Next) {
+        advanceIdlePage();
+        return;
+    }
+    IdlePage page = IdlePage::Rank;
+    switch (screen) {
+        case DemoScreen::Graph: page = IdlePage::RankGraph; break;
+        case DemoScreen::Prices: page = IdlePage::Prices; break;
+        case DemoScreen::Watchlist: page = IdlePage::Watchlist; break;
+        case DemoScreen::Leagues: page = IdlePage::Leagues; break;
+        default: break;
+    }
+    if (idlePageAvailable(page)) {
+        carouselSubPage = 0;
+        showIdlePage(page);
+    }
+}
+
+// uiTask: screen requests, and the gameweek going live once a web demo's deadline has passed.
+static void serviceWebDemo() {
+    if (!demoEnabledFlag || !demoMutex || xSemaphoreTake(demoMutex, 0) != pdTRUE) {
+        return;
+    }
+    const int screen = demoState.screenRequest;
+    demoState.screenRequest = -1;
+    time_t now = 0;
+    if (demoState.enabled && demoState.source != DemoSource::None && demoState.autoKickoff && !demoState.isLiveGw &&
+        demoState.hasDeadline && demoClockValid(now) && now >= demoState.deadlineUtc + kDemoKickoffDelaySec) {
+        demoKickoffLocked(now);
+        publishDemoLocked();
+        Serial.printf("[DEMO] deadline passed, GW%d live\n", demoState.currentGw);
+    }
+    xSemaphoreGive(demoMutex);
+    if (screen >= 0) {
+        demoShowScreen(static_cast<DemoScreen>(screen));
+    }
+}
+
+static const char *demoScreenName() {
+    switch (currentMode) {
+        case UiMode::Idle:
+            switch (idlePage) {
+                case IdlePage::RankGraph: return "graph";
+                case IdlePage::Prices: return "prices";
+                case IdlePage::Watchlist: return "watchlist";
+                case IdlePage::Leagues: return "leagues";
+                default: return "rank";
+            }
+        case UiMode::Deadline: return "deadline";
+        case UiMode::FinalHour: return "final";
+        case UiMode::Live:
+            switch (livePage) {
+                case LivePage::Events: return "events";
+                case LivePage::Squad: return "squad";
+                case LivePage::Leagues: return "leagues";
+                case LivePage::RankGraph: return "graph";
+                default: return "live";
+            }
+        case UiMode::EventPopup: return "popup";
+    }
+    return "rank";
+}
+
+void appDemoStateJson(String &out) {
+    DynamicJsonDocument doc(6144);
+    time_t now = 0;
+    const bool clockValid = demoClockValid(now);
+    doc["hasRealData"] = fplCache && fplCache->hasEntry && fplCache->pickCount > 0;
+    doc["clock"] = clockValid;
+    doc["screen"] = demoScreenName();
+    doc["carouselPaused"] = static_cast<bool>(demoCarouselPaused);
+    if (!demoMutex || xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        doc["enabled"] = static_cast<bool>(demoEnabledFlag);
+        serializeJson(doc, out);
+        return;
+    }
+    const DemoState &s = demoState;
+    doc["enabled"] = s.enabled;
+    doc["source"] = s.source == DemoSource::MyTeam ? "mine" : (s.source == DemoSource::Sample ? "sample" : "serial");
+    if (s.enabled) {
+        doc["gw"] = s.currentGw;
+        doc["nextGw"] = s.hasNextGw ? s.nextGw : 0;
+        doc["live"] = s.isLiveGw;
+        if (s.hasDeadline && clockValid) {
+            doc["deadlineIn"] = static_cast<long>(s.deadlineUtc - now);
+        } else {
+            doc["deadlineIn"] = nullptr;
+        }
+        doc["gwPoints"] = s.gwPoints;
+        doc["totalPoints"] = s.totalPoints;
+        doc["rank"] = s.hasRankData ? s.overallRank : 0;
+        doc["rankDiff"] = s.rankDiff;
+        doc["stale"] = s.stale;
+        doc["autoKickoff"] = s.autoKickoff;
+        doc["rankFollows"] = s.rankFollowsPoints;
+        JsonArray squad = doc.createNestedArray("squad");
+        for (size_t i = 0; i < s.pickCount; ++i) {
+            const TeamPick &p = s.picks[i];
+            bool projectedBonusAdded = false;
+            bool bonusIncluded = false;
+            JsonObject row = squad.createNestedObject();
+            row["slot"] = p.squadPosition;
+            row["name"] = p.playerName.length() ? p.playerName.c_str() : "unknown";
+            row["team"] = p.teamShortName;
+            row["pos"] = p.elementType;
+            row["pts"] = adjustedLivePointsWithProjectedBonus(p, projectedBonusAdded, bonusIncluded);
+            row["mult"] = p.multiplier;
+            row["played"] = p.live.minutes > 0;
+            row["c"] = p.isCaptain;
+            row["vc"] = p.isViceCaptain;
+            row["bench"] = p.squadPosition > 11;
+        }
+    }
+    serializeJson(doc, out);  // before releasing demoMutex: the names point into demoState
+    xSemaphoreGive(demoMutex);
+}
+
+bool appDemoCommand(JsonObjectConst cmd, const char *&error) {
+    error = nullptr;
+    const char *action = cmd["action"] | "";
+    if (strcmp(action, "start") == 0) {
+        const char *source = cmd["source"] | "mine";
+        return demoStart(strcmp(source, "sample") == 0 ? DemoSource::Sample : DemoSource::MyTeam, error);
+    }
+    if (strcmp(action, "restart") == 0) {
+        DemoSource source = DemoSource::MyTeam;
+        if (demoMutex && xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+            if (demoState.source == DemoSource::Sample) {
+                source = DemoSource::Sample;
+            }
+            xSemaphoreGive(demoMutex);
+        }
+        return demoStart(source, error);
+    }
+    if (strcmp(action, "stop") == 0) {
+        if (!demoStop()) {
+            error = "Busy, try again";
+            return false;
+        }
+        return true;
+    }
+    if (!demoMutex || xSemaphoreTake(demoMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        error = "Busy, try again";
+        return false;
+    }
+    bool ok = false;
+    if (!demoState.enabled || !demoState.seeded) {
+        error = "Start the demo first";
+    } else {
+        ok = demoCommandLocked(action, cmd, error);
+    }
+    xSemaphoreGive(demoMutex);
+    return ok;
+}
+
+// --- Setup mode: hold to enter, on-screen instructions --------------------------------------------------------
+
+// Set by runSetupMode (fplTask). The strings are written before the flag, and never change afterwards.
+static volatile bool setupModeActive = false;
+static char setupApName[24] = "";
+static char setupApIp[16] = "";
+
+static struct {
+    lv_obj_t *countdown = nullptr;
+    lv_obj_t *countdownTitle = nullptr;
+    lv_obj_t *countdownNumber = nullptr;
+    lv_obj_t *countdownArc = nullptr;
+    lv_obj_t *info = nullptr;
+} setupUi;
+
+static lv_obj_t *createSetupOverlay() {
+    lv_obj_t *panel = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, kDisplayWidth, kDisplayHeight);
+    lv_obj_center(panel);
+    styleScreen(panel, kColorBgDeep);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    return panel;
+}
+
+static void createSetupCountdown() {
+    setupUi.countdown = createSetupOverlay();
+
+    setupUi.countdownArc = lv_arc_create(setupUi.countdown);
+    lv_obj_set_size(setupUi.countdownArc, kDisplayWidth, kDisplayHeight);
+    lv_obj_center(setupUi.countdownArc);
+    lv_arc_set_bg_angles(setupUi.countdownArc, 0, 360);
+    lv_arc_set_rotation(setupUi.countdownArc, 270);
+    lv_arc_set_range(setupUi.countdownArc, 0, 100);
+    lv_obj_set_style_arc_width(setupUi.countdownArc, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(setupUi.countdownArc, lv_color_hex(kColorAccentCyan), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(setupUi.countdownArc, 6, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(setupUi.countdownArc, lv_color_hex(kColorBgSurface), LV_PART_MAIN);
+    lv_obj_remove_style(setupUi.countdownArc, nullptr, LV_PART_KNOB);
+    lv_obj_remove_flag(setupUi.countdownArc, LV_OBJ_FLAG_CLICKABLE);
+
+    setupUi.countdownTitle = createLabel(setupUi.countdown, kFontCaption, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+    lv_obj_align(setupUi.countdownTitle, LV_ALIGN_CENTER, 0, -56);
+
+    setupUi.countdownNumber = createLabel(setupUi.countdown, kFontHero, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_obj_align(setupUi.countdownNumber, LV_ALIGN_CENTER, 0, 4);
+
+    lv_obj_t *hint = createLabel(setupUi.countdown, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(hint, "Release to cancel");
+    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 64);
+}
+
+static void createSetupInfo() {
+    setupUi.info = createSetupOverlay();
+
+    lv_obj_t *title = createLabel(setupUi.info, kFontCaption, kColorAccentCyan, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(title, "SETUP MODE");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 44);
+
+    // Standard WiFi QR payload: phone cameras offer to join the network.
+    char payload[64];
+    snprintf(payload, sizeof(payload), "WIFI:T:nopass;S:%s;;", setupApName);
+    lv_obj_t *qr = lv_qrcode_create(setupUi.info);
+    lv_qrcode_set_size(qr, 132);
+    lv_qrcode_set_dark_color(qr, lv_color_hex(kColorBgDeep));
+    lv_qrcode_set_light_color(qr, lv_color_hex(kColorTextPrimary));
+    lv_qrcode_set_quiet_zone(qr, true);
+    lv_qrcode_update(qr, payload, strlen(payload));
+    lv_obj_align(qr, LV_ALIGN_TOP_MID, 0, 78);
+
+    lv_obj_t *join = createLabel(setupUi.info, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(join, "Scan with your phone camera, or join WiFi");
+    lv_obj_align(join, LV_ALIGN_TOP_MID, 0, 226);
+
+    lv_obj_t *name = createLabel(setupUi.info, kFontBody, kColorTextPrimary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text(name, setupApName);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 248);
+
+    lv_obj_t *openHint = createLabel(setupUi.info, kFontMicro, kColorTextSecondary, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text_fmt(openHint, "The setup page opens by itself,\nor go to %s", setupApIp);
+    lv_obj_align(openHint, LV_ALIGN_TOP_MID, 0, 282);
+
+    lv_obj_t *exitHint = createLabel(setupUi.info, kFontMicro, kColorAccentAmber, LV_TEXT_ALIGN_CENTER);
+    lv_label_set_text_fmt(exitHint, "Hold the screen %u s to exit", static_cast<unsigned>(kSetupHoldTriggerMs / 1000));
+    lv_obj_align(exitHint, LV_ALIGN_TOP_MID, 0, 334);
+}
+
+static void serviceSetupHold() {
+    if (setupModeActive && !setupUi.info) {
+        createSetupInfo();
+    }
+
+    // Setting a label's text redraws it even when unchanged, so only touch the widgets when a value changes.
+    static bool countdownShown = false;
+    static unsigned shownSeconds = 0;
+    static int shownProgress = -1;
+
+    const uint32_t heldMs = touchPressStartMs != 0 ? millis() - touchPressStartMs : 0;
+    if (heldMs < kSetupHoldPromptMs) {
+        if (countdownShown) {
+            lv_obj_add_flag(setupUi.countdown, LV_OBJ_FLAG_HIDDEN);
+            countdownShown = false;
+        }
+        return;
+    }
+
+    if (!setupUi.countdown) {
+        createSetupCountdown();
+    }
+    if (!countdownShown) {
+        lv_label_set_text(setupUi.countdownTitle, setupModeActive ? "Leaving setup mode in" : "Entering setup mode in");
+        lv_obj_remove_flag(setupUi.countdown, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(setupUi.countdown);
+        countdownShown = true;
+        shownSeconds = 0;
+        shownProgress = -1;
+    }
+
+    if (heldMs >= kSetupHoldTriggerMs) {
+        lv_label_set_text(setupUi.countdownTitle, setupModeActive ? "Leaving setup mode" : "Starting setup mode");
+        lv_label_set_text(setupUi.countdownNumber, "...");
+        lv_arc_set_value(setupUi.countdownArc, 100);
+        lv_refr_now(lvglDisp);
+        // runSetupMode already cleared the flag, so a plain restart leaves setup mode.
+        if (!setupModeActive) {
+            deviceConfigRequestSetupMode(true);
+        }
+        Serial.printf("[SETUP] screen held %u s, restarting %s setup mode\n",
+                      static_cast<unsigned>(kSetupHoldTriggerMs / 1000), setupModeActive ? "out of" : "into");
+        delay(100);
+        ESP.restart();
+    }
+
+    const unsigned seconds = static_cast<unsigned>((kSetupHoldTriggerMs - heldMs + 999) / 1000);
+    if (seconds != shownSeconds) {
+        lv_label_set_text_fmt(setupUi.countdownNumber, "%u", seconds);
+        shownSeconds = seconds;
+    }
+    // 50 steps over 5 s: smooth enough, and each step redraws only a thin slice of the ring.
+    const int progress = static_cast<int>((heldMs - kSetupHoldPromptMs) * 50 / (kSetupHoldTriggerMs - kSetupHoldPromptMs)) * 2;
+    if (progress != shownProgress) {
+        lv_arc_set_value(setupUi.countdownArc, progress);
+        shownProgress = progress;
+    }
 }
 
 static void uiTask(void *) {
@@ -5127,17 +7294,19 @@ static void uiTask(void *) {
 
     for (;;) {
         lv_timer_handler();
+        serviceSetupHold();
         if (readSharedUiState(localState)) {
             snapshotUiRuntime(localRuntime);
             updateModeUi(localState, localRuntime);
             serviceScriptedDemo();
-            serviceIdleCarousel();
+            serviceWebDemo();
+            serviceCarousels();
+            serviceScreenshot();
+            serviceFpsProbe();
 
             UiMode autoMode = determineAutoMode(localState);
-            if (currentMode != UiMode::EventsList && currentMode != UiMode::Squad && currentMode != UiMode::EventPopup) {
-                if (autoMode != currentMode) {
-                    loadMode(autoMode, LV_SCR_LOAD_ANIM_FADE_ON);
-                }
+            if (currentMode != UiMode::EventPopup && autoMode != currentMode) {
+                loadMode(autoMode, LV_SCR_LOAD_ANIM_FADE_ON);
             }
 
             if (currentMode == UiMode::Live) {
@@ -5156,43 +7325,157 @@ static void uiTask(void *) {
     }
 }
 
+// --- Web UI hooks (declared in web_server.h) ----------------------------------------------------------------
+
+bool appGetMiniLeagues(WebLeagueInfo *out, size_t capacity, size_t &count) {
+    count = 0;
+    if (!idleScreensMutex || xSemaphoreTake(idleScreensMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;
+    }
+    // During a web demo the screens show demo leagues; the settings page still lists the real ones.
+    const IdleScreensData &data = demoIdleOverridden ? *demoRealIdle : *idleScreensData;
+    const bool hasLeagues = data.hasLeagues;
+    for (size_t i = 0; hasLeagues && i < data.leagueCount && count < capacity; ++i, ++count) {
+        out[count].id = data.leagues[i].id;
+        strlcpy(out[count].name, data.leagues[i].name, sizeof(out[count].name));
+    }
+    xSemaphoreGive(idleScreensMutex);
+    return hasLeagues;
+}
+
+void appRequestFplPoll() {
+    fplPollRequested = true;
+}
+
+void appShowStatus(const char *text, uint32_t colorHex) {
+    setSharedStatus(text, colorHex);
+}
+
+// WiFi attempts (15 s each) before falling back to setup mode, if WiFi has never connected since boot.
+static constexpr int kWifiAttemptsBeforeSetup = 3;
+// Setup mode restarts to retry the saved WiFi after this long with no one connected to the access point
+// (e.g. the router was just slow to come back after a power cut).
+static constexpr uint32_t kSetupModeIdleRestartMs = 10UL * 60UL * 1000UL;
+
+// Runs the WiFi access point and the setup web UI until the user saves new settings (which restarts).
+[[noreturn]] static void runSetupMode() {
+    deviceConfigRequestSetupMode(false);  // any restart goes back to normal WiFi
+
+    const uint64_t mac = ESP.getEfuseMac();
+    char apName[24];
+    snprintf(apName, sizeof(apName), "FPL-Buddy-%02X%02X", static_cast<uint8_t>(mac >> 32),
+             static_cast<uint8_t>(mac >> 40));
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP_STA);  // STA as well, so the UI can scan for networks
+    WiFi.softAP(apName);
+    strlcpy(setupApName, apName, sizeof(setupApName));
+    strlcpy(setupApIp, WiFi.softAPIP().toString().c_str(), sizeof(setupApIp));
+    setupModeActive = true;  // uiTask shows the instructions
+    webServerStart(true);
+
+    char status[48];
+    snprintf(status, sizeof(status), "Setup: join WiFi %s", apName);
+    setSharedStatus(status, 0x00E5FF);
+    Serial.printf("[SETUP] Join WiFi '%s' and open http://%s/\n", apName, WiFi.softAPIP().toString().c_str());
+
+    static DeviceConfig config;
+    deviceConfigGet(config);
+    uint32_t lastClientMs = millis();
+    for (;;) {
+        if (WiFi.softAPgetStationNum() > 0 || webServerOtaInProgress()) {
+            lastClientMs = millis();
+        } else if (config.wifiSsid[0] && millis() - lastClientMs > kSetupModeIdleRestartMs) {
+            Serial.println("[SETUP] no clients, restarting to retry WiFi");
+            ESP.restart();
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// Shows FPL data (from a poll, or the cache when a demo ends) on the display.
+static void publishSnapshotToUi(const TeamSnapshot &snapshot) {
+    if (snapshot.hasGwState) {
+        char gwStateBuf[48];
+        snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", snapshot.isLiveGw ? "yes" : "no",
+                 snapshot.nextGw);
+        setSharedGwStateText(gwStateBuf);
+    } else {
+        setSharedGwStateText("GW live: ? | next: --");
+    }
+    updateSharedSquadFromPicks(snapshot.picks, snapshot.pickCount);
+    setSharedGwPoints(snapshot.gwPoints);
+    setSharedRankData(snapshot.overallRank, snapshot.rankDiff, snapshot.hasRankData);
+    setSharedGameweekContext(snapshot.isLiveGw, snapshot.currentGw, snapshot.nextGw, snapshot.nextGw > 0,
+                             snapshot.deadlineUtc, snapshot.hasDeadline);
+    ledRingSetLiveState(snapshot.isLiveGw, snapshot.matchInPlay);
+    setSharedTotalPoints(snapshot.overallPoints, true);
+}
+
 static void fplTask(void *) {
     lastPollMs = 0;
     lastWifiRetryMs = 0;
     uint32_t lastSuccessMs = 0;
     uint32_t pollDelayMs = 0;
     uint32_t lastSuccessPollDelayMs = FPL_POLL_INTERVAL_MS;
-    bool demoModeAnnounced = false;
+    bool inDemo = false;
     static TeamSnapshot snapshot;  // static: keeps ~3 KB off the task stack
+    bool wifiEverConnected = false;
+    int wifiFailures = 0;
+
+    {
+        static DeviceConfig config;
+        deviceConfigGet(config);
+        if (deviceConfigSetupModeRequested() || !config.wifiSsid[0]) {
+            runSetupMode();
+        }
+    }
     setSharedStatus("Connecting WiFi...", 0xFFCC66);
 
     for (;;) {
         const uint32_t now = millis();
 
-        if (isScriptedDemoActive()) {
+        if (isScriptedDemoActive() || webServerOtaInProgress()) {
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
+        // The demo owns the display (and publishes its own status) until it stops.
         if (isDemoModeEnabled()) {
-            if (!demoModeAnnounced) {
-                setSharedStatus("Demo mode active", 0x00E5FF);
-                setSharedFreshness(false, now);
-                demoModeAnnounced = true;
-            }
+            inDemo = true;
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
-        demoModeAnnounced = false;
+        if (inDemo) {
+            // The demo just ended: show the cached FPL data again straight away, then refresh it.
+            inDemo = false;
+            if (xSemaphoreTake(fplDataMutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                if (fplCache->hasEntry && !isDemoModeEnabled()) {
+                    fillSnapshotFromCache(*fplCache, snapshot);
+                    publishIdleScreensFromCache(*fplCache);
+                    publishSnapshotToUi(snapshot);
+                    setSharedFreshness(false, lastSuccessMs);
+                }
+                xSemaphoreGive(fplDataMutex);
+            }
+            fplPollRequested = true;
+        }
 
         if (WiFi.status() != WL_CONNECTED) {
             if (lastWifiRetryMs == 0 || now - lastWifiRetryMs >= 10000) {
                 lastWifiRetryMs = now;
                 setSharedStatus("Reconnecting WiFi...", 0xFFCC66);
                 if (connectWiFi()) {
+                    wifiEverConnected = true;
+                    wifiFailures = 0;
+                    webServerStart(false);
                     ensureUkTimeConfigured();
-                    setSharedStatus("WiFi connected", 0x38D39F);
+                    char status[48];
+                    snprintf(status, sizeof(status), "WiFi: %s", WiFi.localIP().toString().c_str());
+                    setSharedStatus(status, 0x38D39F);
                     pollDelayMs = 0;  // refresh as soon as we are back online
+                } else if (!wifiEverConnected && ++wifiFailures >= kWifiAttemptsBeforeSetup) {
+                    Serial.println("WiFi never connected since boot, starting setup mode");
+                    runSetupMode();
                 } else {
                     setSharedStatus("WiFi not connected", 0xFF5A5A);
                 }
@@ -5204,58 +7487,48 @@ static void fplTask(void *) {
         if (lastPollMs == 0 || now - lastPollMs >= pollDelayMs || fplPollRequested) {
             fplPollRequested = false;
             lastPollMs = now;
-            setSharedStatus("Fetching FPL points...", 0xFFCC66);
 
-            FplPollResult result;
-            bool ok = false;
             if (xSemaphoreTake(fplDataMutex, portMAX_DELAY) == pdTRUE) {
-                ok = refreshFplData(result);
+                // The display is updated while holding the cache: a web demo that starts mid-poll waits for the
+                // cache before taking over, so the poll can never overwrite the demo afterwards.
+                if (!isDemoModeEnabled()) {
+                    setSharedStatus("Fetching FPL points...", 0xFFCC66);
+                }
+                FplPollResult result;
+                const bool ok = refreshFplData(result);
                 if (ok) {
+                    pollDelayMs = result.nextPollDelayMs;
+                    lastSuccessPollDelayMs = pollDelayMs;
+                    lastSuccessMs = now;
+                } else {
+                    pollDelayMs = FPL_POLL_INTERVAL_MS;
+                }
+
+                if (ok && !isDemoModeEnabled()) {
                     fillSnapshotFromCache(*fplCache, snapshot);
                     publishIdleScreensFromCache(*fplCache);
+                    if (snapshot.hasGwState) {
+                        Serial.printf("GW state: live=%s next=%d\n", snapshot.isLiveGw ? "yes" : "no", snapshot.nextGw);
+                    }
+                    if (kUseServerEventBreakdown) {
+                        detectAndNotifyPointChangesFromBreakdown(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
+                    } else {
+                        detectAndNotifyPointChanges(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
+                    }
+                    if (result.liveFetched) {
+                        printTeamSnapshot(snapshot);
+                    }
+                    publishSnapshotToUi(snapshot);
+                    setSharedFreshness(false, lastSuccessMs);
+                    setSharedStatus("FPL updated", 0x38D39F);
+                    Serial.printf("FPL GW points: %d\n", snapshot.gwPoints);
+                } else if (!ok && !isDemoModeEnabled()) {
+                    // Idle polls are minutes apart, so "stale" is measured against the interval we expected.
+                    const bool stale = (lastSuccessMs == 0) || ((now - lastSuccessMs) > lastSuccessPollDelayMs + 300000U);
+                    setSharedFreshness(stale, lastSuccessMs);
+                    setSharedStatus("FPL fetch failed", 0xFF5A5A);
                 }
                 xSemaphoreGive(fplDataMutex);
-            }
-
-            if (ok) {
-                pollDelayMs = result.nextPollDelayMs;
-                lastSuccessPollDelayMs = pollDelayMs;
-
-                if (snapshot.hasGwState) {
-                    char gwStateBuf[48];
-                    snprintf(gwStateBuf, sizeof(gwStateBuf), "GW live: %s | next: %d", snapshot.isLiveGw ? "yes" : "no",
-                             snapshot.nextGw);
-                    setSharedGwStateText(gwStateBuf);
-                    Serial.printf("GW state: live=%s next=%d\n", snapshot.isLiveGw ? "yes" : "no", snapshot.nextGw);
-                } else {
-                    setSharedGwStateText("GW live: ? | next: --");
-                }
-
-                updateSharedSquadFromPicks(snapshot.picks, snapshot.pickCount);
-                if (kUseServerEventBreakdown) {
-                    detectAndNotifyPointChangesFromBreakdown(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
-                } else {
-                    detectAndNotifyPointChanges(snapshot.currentGw, snapshot.picks, snapshot.pickCount);
-                }
-                if (result.liveFetched) {
-                    printTeamSnapshot(snapshot);
-                }
-
-                setSharedGwPoints(snapshot.gwPoints);
-                setSharedRankData(snapshot.overallRank, snapshot.rankDiff, snapshot.hasRankData);
-                setSharedGameweekContext(snapshot.isLiveGw, snapshot.currentGw, snapshot.nextGw, snapshot.nextGw > 0,
-                                         snapshot.deadlineUtc, snapshot.hasDeadline);
-                setSharedTotalPoints(snapshot.overallPoints, true);
-                lastSuccessMs = now;
-                setSharedFreshness(false, lastSuccessMs);
-                setSharedStatus("FPL updated", 0x38D39F);
-                Serial.printf("FPL GW points: %d\n", snapshot.gwPoints);
-            } else {
-                pollDelayMs = FPL_POLL_INTERVAL_MS;
-                // Idle polls are minutes apart, so "stale" is measured against the interval we expected.
-                const bool stale = (lastSuccessMs == 0) || ((now - lastSuccessMs) > lastSuccessPollDelayMs + 300000U);
-                setSharedFreshness(stale, lastSuccessMs);
-                setSharedStatus("FPL fetch failed", 0xFF5A5A);
             }
         }
 
@@ -5263,14 +7536,36 @@ static void fplTask(void *) {
     }
 }
 
+// Pushes the LED ring settings to the ring whenever they change (web UI or serial).
+static void applyLedRingSettingsIfChanged(uint32_t &knownVersion) {
+    const uint32_t version = displaySettingsVersion();
+    if (version == 0 || version == knownVersion) {
+        return;
+    }
+    static DisplaySettings settings;  // static: keeps it off the LED task stack; only this task touches it
+    displaySettingsGet(settings);
+    ledRingApplySettings(settings.ledRankBrightnessPct, settings.ledDeadlineBrightnessPct,
+                         settings.ledNotificationBrightnessPct, settings.ledRankOnlyLiveGw,
+                         settings.ledRankOnlyMatchLive);
+    knownVersion = version;
+}
+
 static void ledTask(void *) {
+    uint32_t settingsVersion = 0;
+    uint32_t lastSettingsCheckMs = 0;
     for (;;) {
-        ledRingTick(millis());
+        const uint32_t now = millis();
+        if (settingsVersion == 0 || now - lastSettingsCheckMs >= 250) {
+            lastSettingsCheckMs = now;
+            applyLedRingSettingsIfChanged(settingsVersion);
+        }
+        ledRingTick(now);
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void setup() {
+    powerInit();
     Serial.begin(115200);
     delay(500);
 
@@ -5279,7 +7574,8 @@ void setup() {
     idleScreensData = psramNew<IdleScreensData>();
     idleUiData = psramNew<IdleScreensData>();
     serialIdleData = psramNew<IdleScreensData>();
-    if (!kitImageBuffer || !fplCache || !idleScreensData || !idleUiData || !serialIdleData) {
+    demoRealIdle = psramNew<IdleScreensData>();
+    if (!kitImageBuffer || !fplCache || !idleScreensData || !idleUiData || !serialIdleData || !demoRealIdle) {
         Serial.println("PSRAM allocation failed");
         while (true) {
             delay(1000);
@@ -5287,6 +7583,7 @@ void setup() {
     }
 
     Serial.println("\\n=== Waveshare ESP32-S3-Touch-LCD-1.46B: FPL Buddy ===");
+    powerLogState();
     ledRingInit();
 
     if (!display.begin()) {
@@ -5311,7 +7608,8 @@ void setup() {
     lv_tick_set_cb(lvglTickCb);
 
     lvglBuf = static_cast<uint8_t *>(heap_caps_malloc(kLvglBufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA));
-    if (!lvglBuf) {
+    lvglBuf2 = static_cast<uint8_t *>(heap_caps_malloc(kLvglBufPixels * sizeof(lv_color_t), MALLOC_CAP_DMA));
+    if (!lvglBuf || !lvglBuf2) {
         Serial.println("LVGL DMA buffer allocation failed");
         while (true) {
             delay(1000);
@@ -5327,7 +7625,15 @@ void setup() {
         }
     }
     lv_display_set_flush_cb(lvglDisp, lvglFlushCb);
-    lv_display_set_buffers(lvglDisp, lvglBuf, nullptr, kLvglBufPixels * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    // The panel takes big-endian RGB565. Rendering straight into that order saves a byte-swap pass per band,
+    // which otherwise sits between one band's transfer finishing and the next one starting.
+    lv_display_set_color_format(lvglDisp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+    lv_display_set_buffers(lvglDisp, lvglBuf, lvglBuf2, kLvglBufPixels * sizeof(lv_color_t),
+                           LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_add_event_cb(lvglDisp, lvglRounderCb, LV_EVENT_INVALIDATE_AREA, nullptr);
+    display.setTransferDoneCallback(lvglTransferDone, lvglDisp);
+    lv_display_add_event_cb(lvglDisp, lvglFrameTimingCb, LV_EVENT_REFR_START, nullptr);
+    lv_display_add_event_cb(lvglDisp, lvglFrameTimingCb, LV_EVENT_REFR_READY, nullptr);
 
     Serial.println("Create LVGL input...");
     lv_indev_t *touchIndev = lv_indev_create();
@@ -5351,6 +7657,8 @@ void setup() {
     fplDataMutex = xSemaphoreCreateMutex();
     idleScreensMutex = xSemaphoreCreateMutex();
     displaySettingsInit();
+    deviceConfigInit();
+    WiFi.persistent(false);  // credentials live in device_config; stop the WiFi driver keeping its own copy
     if (!sharedUiMutex) {
         Serial.println("Failed to create UI state mutex");
         while (true) {
@@ -5385,6 +7693,7 @@ void setup() {
     setSharedStatus("Booting...", 0xA0A0A0);
     setSharedGwStateText("GW live: ? | next: --");
     setSharedGameweekContext(false, 0, 0, false, 0, false);
+    ledRingSetLiveState(false, false);
     setSharedRankData(0, 0, false);
     setSharedTotalPoints(0, false);
     setSharedFreshness(true, 0);

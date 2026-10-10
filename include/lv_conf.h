@@ -40,7 +40,9 @@
  * - LV_STDLIB_RTTHREAD:    RT-Thread implementation
  * - LV_STDLIB_CUSTOM:      Implement the functions externally
  */
-#define LV_USE_STDLIB_MALLOC    LV_STDLIB_CLIB
+/* Built-in allocator on a PSRAM pool: widget churn must not fragment internal RAM, which a TLS handshake
+ * needs ~40 KB of in one piece. */
+#define LV_USE_STDLIB_MALLOC    LV_STDLIB_BUILTIN
 
 /** Possible values
  * - LV_STDLIB_BUILTIN:     LVGL's built in implementation
@@ -69,7 +71,7 @@
 
 #if LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN
     /** Size of memory available for `lv_malloc()` in bytes (>= 2kB) */
-#define LV_MEM_SIZE (64 * 1024U)          /**< unused when LV_USE_STDLIB_MALLOC == LV_STDLIB_CLIB */
+#define LV_MEM_SIZE (512 * 1024U)          /**< unused when LV_USE_STDLIB_MALLOC == LV_STDLIB_CLIB */
 
     /** Size of the memory expand for `lv_malloc()` in bytes */
     #define LV_MEM_POOL_EXPAND_SIZE 0
@@ -78,8 +80,8 @@
     #define LV_MEM_ADR 0     /**< 0: unused*/
     /* Instead of an address give a memory allocator that will be called to get a memory pool for LVGL. E.g. my_malloc */
     #if LV_MEM_ADR == 0
-        #undef LV_MEM_POOL_INCLUDE
-        #undef LV_MEM_POOL_ALLOC
+        #define LV_MEM_POOL_INCLUDE <esp_heap_caps.h>
+        #define LV_MEM_POOL_ALLOC(size) heap_caps_malloc((size), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
     #endif
 #endif  /*LV_USE_STDLIB_MALLOC == LV_STDLIB_BUILTIN*/
 
@@ -88,7 +90,7 @@
  *====================*/
 
 /** Default display refresh, input device read and animation step period. */
-#define LV_DEF_REFR_PERIOD  33      /**< [ms] */
+#define LV_DEF_REFR_PERIOD  16      /**< [ms] */
 
 /** Default Dots Per Inch. Used to initialize default sizes such as widgets sized, style paddings.
  * (Not so important, you can adjust it to modify default sizes and spaces.) */
@@ -516,7 +518,7 @@
 #define LV_COLOR_MIX_ROUND_OFS  0
 
 /** Add 2 x 32-bit variables to each `lv_obj_t` to speed up getting style properties */
-#define LV_OBJ_STYLE_CACHE      0
+#define LV_OBJ_STYLE_CACHE      1
 
 /** Add `id` field to `lv_obj_t` */
 #define LV_USE_OBJ_ID           0
@@ -965,7 +967,7 @@
 #define LV_USE_RLE 0
 
 /** QR code library */
-#define LV_USE_QRCODE 0
+#define LV_USE_QRCODE 1
 
 /** Barcode code library */
 #define LV_USE_BARCODE 0

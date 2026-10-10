@@ -1,6 +1,9 @@
 #pragma once
 
-// Your public FPL entry/team ID:
+// Firmware version, shown in the web UI (http://fpl-buddy.local). Bump it for each release.
+#define FPL_FIRMWARE_VERSION "1.0.0"
+
+// Your public FPL entry/team ID (first-boot default; change it later in the web UI):
 // https://fantasy.premierleague.com/entry/<ID>/event/<GW>
 #ifndef FPL_ENTRY_ID
 #define FPL_ENTRY_ID 2752740
@@ -110,15 +113,41 @@
 #endif
 
 #ifndef FPL_LED_RING_PIN
-#define FPL_LED_RING_PIN 1
+#define FPL_LED_RING_PIN 13
 #endif
 
 #ifndef FPL_LED_RING_LED_COUNT
 #define FPL_LED_RING_LED_COUNT 16
 #endif
 
+// Hardware cap (0-255). The brightness settings below are a percentage of this.
 #ifndef FPL_LED_RING_MAX_BRIGHTNESS
 #define FPL_LED_RING_MAX_BRIGHTNESS 64
+#endif
+
+// First-boot defaults for the LED ring settings (web UI), saved to flash once changed.
+// Brightness in percent of FPL_LED_RING_MAX_BRIGHTNESS (0 = off).
+#ifndef FPL_LED_RANK_BRIGHTNESS_PCT
+#define FPL_LED_RANK_BRIGHTNESS_PCT 100
+#endif
+
+#ifndef FPL_LED_DEADLINE_BRIGHTNESS_PCT
+#define FPL_LED_DEADLINE_BRIGHTNESS_PCT 100
+#endif
+
+// Purple flash when a player event pops up.
+#ifndef FPL_LED_NOTIFICATION_BRIGHTNESS_PCT
+#define FPL_LED_NOTIFICATION_BRIGHTNESS_PCT 100
+#endif
+
+// 1 = rank LEDs only while the gameweek is live (not between gameweeks).
+#ifndef FPL_LED_RANK_ONLY_LIVE_GW
+#define FPL_LED_RANK_ONLY_LIVE_GW 0
+#endif
+
+// 1 = rank LEDs only while a match is in play.
+#ifndef FPL_LED_RANK_ONLY_MATCH_LIVE
+#define FPL_LED_RANK_ONLY_MATCH_LIVE 0
 #endif
 
 #ifndef FPL_LED_RING_SPIN_INTERVAL_MS

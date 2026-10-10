@@ -56,6 +56,11 @@ public:
 
     bool begin();
     void drawBitmap(int x, int y, int w, int h, const uint8_t *data);
+    // Sends big-endian RGB565 pixels straight from `data` (DMA-capable memory), without copying. x and w must be
+    // multiples of 4 (the panel's column alignment). Returns once the transfer is queued; the transfer-done
+    // callback then runs, from an interrupt, when `data` may be reused. Returns false if nothing was queued.
+    bool drawBitmapAsync(int x, int y, int w, int h, const void *data);
+    void setTransferDoneCallback(void (*cb)(void *ctx), void *ctx);
     void fillScreen(uint16_t color);
     void setBacklight(uint8_t brightness);
 
@@ -67,6 +72,10 @@ private:
     esp_lcd_panel_io_handle_t _io;
     bool _initialized;
 
+    void (*_doneCb)(void *ctx) = nullptr;
+    void *_doneCtx = nullptr;
+
+    static bool onColorTransDone(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *edata, void *ctx);
     void resetDisplay();
     bool initPanel();
     void expanderWrite(uint8_t pin, uint8_t value);
